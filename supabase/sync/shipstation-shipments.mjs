@@ -193,43 +193,59 @@ async function processShipment(ss, index, total) {
         if (existId) existing = { id: existId, data_source: 'shipstation' };
     }
 
-    // 2. If existing Veeqo shipment, enrich with ShipStation cost data
-    if (existing?.data_source === 'veeqo') {
-        // Only update if we have cost data to add
-        if (cost != null) {
-            try {
-                if (!DRY_RUN) {
-                    await fetch(`${SUPA_URL}/rest/v1/shipments?id=eq.${existing.id}`, {
-                        method: 'PATCH',
-                        headers: {
-                            apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`,
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({
-                            label_cost: cost,
-                            insurance_cost: ss.insuranceCost || 0,
-                            total_cost: +(cost + (ss.insuranceCost || 0)).toFixed(2),
-                            external_ids: { veeqo: undefined, shipstation: ssId } // merge
-                        })
-                    });
-                }
-                stats.matched++;
-                stats.total_label_spend += cost;
-            } catch (e) {
-                stats.errors++;
+    // 1b. Try to match by order — merge into existing Veeqo row instead of creating dupe
+    let orderId = await findOrderByNumber(orderNumber);
+    if (!existing && orderId) {
+        const orderShipments = await supaGet(`shipments?order_id=eq.${orderId}&select=id,data_source,tracking_number,external_ids&limit=5`);
+        if (orderShipments?.length) {
+            // Prefer a row that has no tracking (Veeqo placeholder) or same tracking
+            const placeholder = orderShipments.find(s => !s.tracking_number);
+            const sameTracking = tracking ? orderShipments.find(s => s.tracking_number === tracking) : null;
+            const match = sameTracking || placeholder || orderShipments[0];
+            existing = { id: match.id, data_source: match.data_source, external_ids: match.external_ids };
+        }
+    }
+
+    // 2. If existing shipment (Veeqo or otherwise), enrich with ShipStation data
+    if (existing) {
+        try {
+            const mergedExternalIds = { ...(existing.external_ids || {}), shipstation: ssId };
+            const patch = { external_ids: mergedExternalIds };
+
+            // Fill in missing fields from ShipStation
+            if (tracking) patch.tracking_number = tracking;
+            if (cost != null) {
+                patch.label_cost = cost;
+                patch.insurance_cost = ss.insuranceCost || 0;
+                patch.total_cost = +(cost + (ss.insuranceCost || 0)).toFixed(2);
             }
+            if (carrier) {
+                patch.carrier_name = CARRIER_NAMES[carrier] || carrier;
+                patch.carrier_code = carrier;
+            }
+            if (service) patch.carrier_service = service;
+            if (ss.shipDate) patch.shipped_at = ss.shipDate + 'T00:00:00Z';
+            if (tracking) patch.status = 'in_transit';
+
+            if (!DRY_RUN) {
+                await fetch(`${SUPA_URL}/rest/v1/shipments?id=eq.${existing.id}`, {
+                    method: 'PATCH',
+                    headers: {
+                        apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`,
+                        'Content-Type': 'application/json', Prefer: 'return=minimal'
+                    },
+                    body: JSON.stringify(patch)
+                });
+            }
+            stats.matched++;
+            if (cost != null) stats.total_label_spend += cost;
+        } catch (e) {
+            stats.errors++;
         }
         return;
     }
 
-    // 3. If existing ShipStation record, update it
-    if (existing) {
-        stats.updated++;
-        return;
-    }
-
-    // 4. New shipment — find the order
-    let orderId = await findOrderByNumber(orderNumber);
+    // 3. New shipment with no matching order — skip
     if (!orderId) {
         stats.skipped++;
         return;

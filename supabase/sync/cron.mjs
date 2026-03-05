@@ -62,6 +62,42 @@ const JOBS = {
         api_group: 'walmart',
         interval_min: 360,       // Every 6 hours
         description: 'Enrich Walmart orders with API data'
+    },
+    'amazon-enrich': {
+        script: 'amazon-enrich.mjs',
+        api_group: 'amazon',
+        interval_min: 360,       // Every 6 hours
+        description: 'Enrich Amazon orders with tax/shipping from SP-API'
+    },
+    'returns-sync': {
+        script: 'returns-sync.mjs',
+        api_group: 'amazon',
+        interval_min: 720,       // Every 12 hours
+        description: 'Sync returns from Amazon reports + Walmart API'
+    },
+    'walmart-fees': {
+        script: 'walmart-fees.mjs',
+        api_group: 'walmart',
+        interval_min: 720,       // Every 12 hours
+        description: 'Import Walmart recon reports (commissions, fees)'
+    },
+    'amazon-settlements': {
+        script: 'amazon-settlements.mjs',
+        api_group: 'amazon',
+        interval_min: 720,       // Every 12 hours
+        description: 'Import Amazon settlement reports (fees, commissions)'
+    },
+    'sellersnap-costs': {
+        script: 'sellersnap-costs.mjs',
+        api_group: 'sellersnap',
+        interval_min: 1440,      // Every 24 hours
+        description: 'Sync product costs from SellerSnap'
+    },
+    'inventory-snapshot': {
+        script: 'inventory-snapshot.mjs',
+        api_group: 'veeqo',
+        interval_min: 1440,      // Once per day (runs at 6am via cron)
+        description: 'Daily inventory snapshot for sell-through analysis'
     }
 };
 

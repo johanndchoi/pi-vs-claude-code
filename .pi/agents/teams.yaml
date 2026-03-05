@@ -21,6 +21,11 @@ frontend:
   - builder
   - bowser
 
+customer-support:
+  - cs-triage
+  - cs-troubleshooter
+  - cs-responder
+
 pi-pi:
   - ext-expert
   - theme-expert

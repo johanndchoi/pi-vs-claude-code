@@ -1,0 +1,542 @@
+{
+  "updatedAt": "2026-03-03T20:29:12.953Z",
+  "createdAt": "2026-03-02T19:34:39.786Z",
+  "id": "VkYsADlbTWkHkLtA",
+  "name": "Production Line Image Identifier (Supabase)",
+  "description": null,
+  "active": false,
+  "isArchived": false,
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "triggerOn": "specificFolder",
+        "folderToWatch": {
+          "__rl": true,
+          "value": "1nL7sox186wNSRL_RMQGW2IsZOJ810lm5",
+          "mode": "list",
+          "cachedResultName": "3133 E 12th St, Los Angeles, CA, 90023",
+          "cachedResultUrl": "https://drive.google.com/drive/folders/1nL7sox186wNSRL_RMQGW2IsZOJ810lm5"
+        },
+        "event": "fileCreated",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDriveTrigger",
+      "typeVersion": 1,
+      "position": [
+        2512,
+        1088
+      ],
+      "id": "5401fdc8-70b3-4a12-901c-acd4b8fde843",
+      "name": "Google Drive Trigger",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "tGrFTUfIPQ2SnicZ",
+          "name": "Google Drive OAuth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $json.id }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        2800,
+        800
+      ],
+      "id": "0295c4e0-493a-4aba-950c-4ae8b4e1e249",
+      "name": "Download file",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "tGrFTUfIPQ2SnicZ",
+          "name": "Google Drive OAuth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "binaryToPropery",
+        "options": {
+          "keepSource": "binary"
+        }
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        2960,
+        800
+      ],
+      "id": "d61b0f23-5c2e-4e7f-9399-970fc4c9c0fd",
+      "name": "Extract from File"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-tesseractjs.tesseractNode",
+      "typeVersion": 1,
+      "position": [
+        3184,
+        800
+      ],
+      "id": "cd7dc0ef-49e0-420d-95c3-6a9a851b4970",
+      "name": "Tesseract"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract tracking number from Tesseract OCR output\n// The Tesseract node outputs the raw OCR text — we just need to find the tracking number\n\nreturn items.map((item) => {\n    // Tesseract node output: text is in item.json.text or item.json.data or item.json\n    const ocrText = item.json?.text || item.json?.data?.text || item.json?.recognizedText || JSON.stringify(item.json) || '';\n    const confidence = item.json?.confidence || item.json?.data?.confidence || 0;\n\n    // --- Extract tracking numbers using carrier patterns ---\n    const patterns = [\n        // UPS: 1Z + 6 alphanumeric + 10 digits (18 chars)\n        // Handles OCR errors: I→1, 2→Z for first two chars\n        { carrier: 'UPS', re: /[1Il][Z2][0-9A-Z]{6}[0-9]{10}/gi, fix: s => '1Z' + s.slice(2).toUpperCase() },\n\n        // USPS: 20-34 digits starting with 9\n        { carrier: 'USPS', re: /9[0-9]{19,33}/g, fix: s => s },\n\n        // FedEx: 12 or 15 digits\n        { carrier: 'FedEx', re: /\\b[0-9]{12}\\b/g, fix: s => s },\n        { carrier: 'FedEx', re: /\\b[0-9]{15}\\b/g, fix: s => s },\n\n        // OnTrac: C or D + 14-19 digits\n        { carrier: 'OnTrac', re: /[CD][0-9]{14,19}/gi, fix: s => s.toUpperCase() },\n\n        // Amazon Logistics: TBA + 10-15 digits\n        { carrier: 'Amazon', re: /TBA[0-9]{10,15}/gi, fix: s => s.toUpperCase() },\n    ];\n\n    // Also try with all spaces/hyphens stripped\n    const stripped = ocrText.replace(/[\\s-]/g, '');\n\n    const found = new Map();\n    for (const { carrier, re, fix } of patterns) {\n        for (const src of [ocrText, stripped]) {\n            const matches = src.match(re) || [];\n            for (const m of matches) {\n                const normalized = fix(m);\n                if (!found.has(normalized)) {\n                    found.set(normalized, carrier);\n                }\n            }\n        }\n    }\n\n    // Pick the best tracking number (prefer UPS/USPS/FedEx over others)\n    const priority = ['UPS', 'USPS', 'FedEx', 'OnTrac', 'Amazon'];\n    let trackingNumber = '';\n    for (const carrier of priority) {\n        for (const [tn, c] of found) {\n            if (c === carrier) { trackingNumber = tn; break; }\n        }\n        if (trackingNumber) break;\n    }\n\n    // Fallback: look for \"tracking\" keyword nearby\n    if (!trackingNumber) {\n        const m = ocrText.match(/tracking\\s*(?:number|#|no)?\\s*:?\\s*([A-Z0-9]{10,35})/i);\n        if (m) trackingNumber = m[1].replace(/[^A-Z0-9]/gi, '');\n    }\n\n    return {\n        json: {\n            trackingNumber,\n            ocrRaw: ocrText.trim(),\n            ocrConfidence: confidence,\n            allTracking: Object.fromEntries(found),\n        },\n    };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3472,
+        800
+      ],
+      "id": "de9a87c2-60fa-406a-8c3f-84ffadfd3198",
+      "name": "Extract Tracking Number"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $('Download file').item.json.id }}",
+          "mode": "id"
+        },
+        "newUpdatedFileName": "={{ $('Extract Tracking Number').item.json.trackingNumber }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        3696,
+        800
+      ],
+      "id": "a69e3ca4-0cbe-40ce-8930-3130286c04cb",
+      "name": "Rename to Tracking Number",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "tGrFTUfIPQ2SnicZ",
+          "name": "Google Drive OAuth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/shipments?tracking_number=eq.{{ $('Rename to Tracking Number').item.json.name }}&select=id,tracking_number,carrier_name,order_id",
+        "authentication": "none",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNrZ3pjbGxvbWhzbXBia2RucXFjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjE0NDMwMywiZXhwIjoyMDg3NzIwMzAzfQ.1EFO3yNLwBz3Ov70tGDGCwC_bupXaBc8j-JpBZ_LuY0"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNrZ3pjbGxvbWhzbXBia2RucXFjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjE0NDMwMywiZXhwIjoyMDg3NzIwMzAzfQ.1EFO3yNLwBz3Ov70tGDGCwC_bupXaBc8j-JpBZ_LuY0"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        4128,
+        800
+      ],
+      "id": "eae94ab9-e945-4ef2-b8ce-feb328c50fae",
+      "name": "Find Shipment in Supabase"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://skgzcllomhsmpbkdnqqc.supabase.co/storage/v1/object/shipment-photos/matched/{{ $('Extract Tracking Number').item.json.trackingNumber }}/{{ $now.format('yyyy-MM-dd_HH-mm-ss') }}.{{ $('Download file').item.binary.data.fileExtension || 'jpg' }}",
+        "authentication": "none",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "={{ $('Download file').item.binary.data.mimeType }}"
+            },
+            {
+              "name": "x-upsert",
+              "value": "true"
+            },
+            {
+              "name": "apikey",
+              "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNrZ3pjbGxvbWhzbXBia2RucXFjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjE0NDMwMywiZXhwIjoyMDg3NzIwMzAzfQ.1EFO3yNLwBz3Ov70tGDGCwC_bupXaBc8j-JpBZ_LuY0"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNrZ3pjbGxvbWhzbXBia2RucXFjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjE0NDMwMywiZXhwIjoyMDg3NzIwMzAzfQ.1EFO3yNLwBz3Ov70tGDGCwC_bupXaBc8j-JpBZ_LuY0"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "={{ $('Download file').item.binary.data.mimeType }}",
+        "body": "={{ $('Download file').item.binary.data }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        4336,
+        800
+      ],
+      "id": "6c2de39f-f8ee-44b4-87cf-c7c0cf1eceb8",
+      "name": "Upload Photo to Supabase Storage"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/shipment_photos",
+        "authentication": "none",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=representation"
+            },
+            {
+              "name": "apikey",
+              "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNrZ3pjbGxvbWhzbXBia2RucXFjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjE0NDMwMywiZXhwIjoyMDg3NzIwMzAzfQ.1EFO3yNLwBz3Ov70tGDGCwC_bupXaBc8j-JpBZ_LuY0"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNrZ3pjbGxvbWhzbXBia2RucXFjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjE0NDMwMywiZXhwIjoyMDg3NzIwMzAzfQ.1EFO3yNLwBz3Ov70tGDGCwC_bupXaBc8j-JpBZ_LuY0"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"shipment_id\": {{ $('Find Shipment in Supabase').item.json[0]?.id ? '\"' + $('Find Shipment in Supabase').item.json[0].id + '\"' : 'null' }},\n  \"tracking_number\": \"{{ $('Extract Tracking Number').item.json.trackingNumber }}\",\n  \"storage_path\": \"matched/{{ $('Extract Tracking Number').item.json.trackingNumber }}/{{ $now.format('yyyy-MM-dd_HH-mm-ss') }}.{{ $('Download file').item.binary.data.fileExtension || 'jpg' }}\",\n  \"ocr_raw\": {{ JSON.stringify($('Extract Tracking Number').item.json.ocrRaw || '') }},\n  \"ocr_confidence\": {{ $('Extract Tracking Number').item.json.ocrConfidence || 0 }},\n  \"drive_file_id\": \"{{ $('Download file').item.json.id }}\",\n  \"file_size_bytes\": {{ $('Download file').item.binary.data.fileSize || 0 }},\n  \"mime_type\": \"{{ $('Download file').item.binary.data.mimeType || 'image/jpeg' }}\",\n  \"matched\": {{ $('Find Shipment in Supabase').item.json.length > 0 }},\n  \"match_method\": {{ $('Find Shipment in Supabase').item.json.length > 0 ? '\"exact\"' : 'null' }}\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        4560,
+        800
+      ],
+      "id": "d15be7b3-7fad-4b43-beaf-cb918505f349",
+      "name": "Create Photo Record"
+    },
+    {
+      "parameters": {
+        "operation": "move",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $('Rename to Tracking Number').item.json.id }}",
+          "mode": "id"
+        },
+        "driveId": {
+          "__rl": true,
+          "value": "0ALZy48hNtvzNUk9PVA",
+          "mode": "list",
+          "cachedResultName": "Shipment Verification",
+          "cachedResultUrl": "https://drive.google.com/drive/folders/0ALZy48hNtvzNUk9PVA"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "root",
+          "cachedResultName": "/ (Root folder)"
+        }
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        4784,
+        800
+      ],
+      "id": "3c267950-0897-42a9-b7ce-98d795aeb604",
+      "name": "Move file",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "tGrFTUfIPQ2SnicZ",
+          "name": "Google Drive OAuth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "fileFolder",
+        "returnAll": true,
+        "filter": {
+          "folderId": {
+            "__rl": true,
+            "value": "1nL7sox186wNSRL_RMQGW2IsZOJ810lm5",
+            "mode": "list",
+            "cachedResultName": "3133 E 12th St, Los Angeles, CA, 90023",
+            "cachedResultUrl": "https://drive.google.com/drive/folders/1nL7sox186wNSRL_RMQGW2IsZOJ810lm5"
+          }
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        2352,
+        784
+      ],
+      "id": "c86075aa-173e-4004-a9af-c6ae39d3fd6b",
+      "name": "Search files and folders",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "tGrFTUfIPQ2SnicZ",
+          "name": "Google Drive OAuth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "batchSize": 25,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        2544,
+        784
+      ],
+      "id": "0c4904f7-b1cb-4a0d-9738-932d7b11bd55",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        2112,
+        784
+      ],
+      "id": "df7da292-e4c2-43b3-8394-149f5204edc5",
+      "name": "When clicking 'Execute workflow'"
+    }
+  ],
+  "connections": {
+    "Google Drive Trigger": {
+      "main": [
+        [
+          {
+            "node": "Download file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download file": {
+      "main": [
+        [
+          {
+            "node": "Extract from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File": {
+      "main": [
+        [
+          {
+            "node": "Tesseract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tesseract": {
+      "main": [
+        [
+          {
+            "node": "Extract Tracking Number",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Tracking Number": {
+      "main": [
+        [
+          {
+            "node": "Rename to Tracking Number",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rename to Tracking Number": {
+      "main": [
+        [
+          {
+            "node": "Find Shipment in Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Shipment in Supabase": {
+      "main": [
+        [
+          {
+            "node": "Upload Photo to Supabase Storage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Photo to Supabase Storage": {
+      "main": [
+        [
+          {
+            "node": "Create Photo Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Photo Record": {
+      "main": [
+        [
+          {
+            "node": "Move file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Move file": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Download file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search files and folders": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When clicking 'Execute workflow'": {
+      "main": [
+        [
+          {
+            "node": "Search files and folders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "pinData": {},
+  "versionId": "04934936-1ab8-4f09-ab31-95f1dce158c3",
+  "activeVersionId": null,
+  "versionCounter": 32,
+  "triggerCount": 0,
+  "shared": [
+    {
+      "updatedAt": "2026-03-02T19:34:39.786Z",
+      "createdAt": "2026-03-02T19:34:39.786Z",
+      "role": "workflow:owner",
+      "workflowId": "VkYsADlbTWkHkLtA",
+      "projectId": "RQwDCgOCPMSdKTdR",
+      "project": {
+        "updatedAt": "2025-11-10T04:48:34.082Z",
+        "createdAt": "2025-11-06T07:48:50.257Z",
+        "id": "RQwDCgOCPMSdKTdR",
+        "name": "Johann Choi <johanndchoi@snatched-it.com>",
+        "type": "personal",
+        "icon": null,
+        "description": null,
+        "creatorId": "b02135cd-ab0c-47b1-8cf4-4e9ed0aefe5e"
+      }
+    }
+  ],
+  "tags": [],
+  "activeVersion": null
+}

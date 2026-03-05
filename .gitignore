@@ -13,4 +13,5 @@ __pycache__/
 
 .playwright-cli/
 
-tmp/
+tmp/.env.skills
+start-pi.sh
