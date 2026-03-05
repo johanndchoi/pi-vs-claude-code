@@ -22,9 +22,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const DRY_RUN = args.includes('--dry-run');
 const RESET = args.includes('--reset');
+const LIMIT = (() => { const i = args.indexOf('--limit'); return i >= 0 ? parseInt(args[i + 1]) : Infinity; })();
 
 const CURSOR_FILE = join(__dirname, '..', '.locks', 'crossvalidate-shipments.cursor');
-const BATCH_SIZE = 100;
+const BATCH_SIZE = 200;
 
 // ─── Credentials ─────────────────────────────────────────────────────
 function loadEnv() {
@@ -50,6 +51,7 @@ if (!SUPA_URL || !SUPA_KEY) { console.error('Missing Supabase credentials'); pro
 
 // ─── Logging & Utils ─────────────────────────────────────────────────
 const stats = { processed: 0, matched: 0, updated: 0, not_found: 0, skipped: 0, errors: 0 };
+const ssCache = {};  // Cache ShipStation results per order number
 function log(msg) { console.log(`[${new Date().toLocaleTimeString()}] ${msg}`); }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -133,7 +135,8 @@ async function supaPatch(table, id, data) {
 // ─── Fetch shipments needing enrichment ──────────────────────────────
 async function fetchIncompleteShipments(lastId) {
     // Shipments missing label_cost OR tracking_number, not voided
-    let filter = 'shipments?is_voided=eq.false&or=(label_cost.is.null,tracking_number.is.null)';
+    // Also include label_cost=0 (likely data gaps)
+    let filter = 'shipments?is_voided=eq.false&or=(label_cost.is.null,label_cost.eq.0,tracking_number.is.null)';
     filter += '&select=id,order_id,tracking_number,label_cost,carrier_name,carrier_service,shipped_at,data_source';
     filter += `&order=id.asc&limit=${BATCH_SIZE}`;
     if (lastId) filter += `&id=gt.${lastId}`;
@@ -142,16 +145,26 @@ async function fetchIncompleteShipments(lastId) {
     return { shipments: data || [], totalRemaining: count };
 }
 
-// ─── Fetch order number for a shipment ───────────────────────────────
+// ─── Batch fetch order numbers ───────────────────────────────────────
 const orderCache = {};
 
-async function getOrderNumber(orderId) {
-    if (!orderId) return null;
-    if (orderCache[orderId]) return orderCache[orderId];
-    const { data } = await supaGet(`orders?id=eq.${orderId}&select=order_number&limit=1`);
-    const num = data?.[0]?.order_number || null;
-    if (num) orderCache[orderId] = num;
-    return num;
+async function batchLoadOrderNumbers(orderIds) {
+    const uncached = [...new Set(orderIds.filter(id => id && !orderCache[id]))];
+    if (uncached.length === 0) return;
+
+    // Supabase REST API: in filter, batch of 50 at a time
+    for (let i = 0; i < uncached.length; i += 50) {
+        const batch = uncached.slice(i, i + 50);
+        const inFilter = batch.map(id => `"${id}"`).join(',');
+        const { data } = await supaGet(`orders?id=in.(${inFilter})&select=id,order_number`);
+        for (const row of (data || [])) {
+            orderCache[row.id] = row.order_number;
+        }
+    }
+}
+
+function getOrderNumber(orderId) {
+    return orderCache[orderId] || null;
 }
 
 // ─── Search ShipStation for matching shipment ────────────────────────
@@ -194,7 +207,7 @@ function buildUpdate(supaShipment, ssMatch) {
     const update = {};
     let changed = false;
 
-    if (supaShipment.label_cost == null && ssMatch.shipmentCost != null) {
+    if ((supaShipment.label_cost == null || supaShipment.label_cost === 0) && ssMatch.shipmentCost != null && ssMatch.shipmentCost > 0) {
         update.label_cost = ssMatch.shipmentCost;
         update.total_cost = +(ssMatch.shipmentCost + (ssMatch.insuranceCost || 0)).toFixed(2);
         if (ssMatch.insuranceCost) update.insurance_cost = ssMatch.insuranceCost;
@@ -233,6 +246,7 @@ function buildUpdate(supaShipment, ssMatch) {
 async function main() {
     log('Cross-Validate Shipments: Veeqo ↔ ShipStation');
     if (DRY_RUN) log('*** DRY RUN — no writes ***');
+    if (LIMIT < Infinity) log(`Limit: ${LIMIT} shipments`);
 
     const cursor = loadCursor();
     let lastId = cursor?.last_id || null;
@@ -243,9 +257,8 @@ async function main() {
     log(`Total incomplete shipments (missing cost or tracking): ${totalRemaining}`);
 
     let batchNum = 0;
-    let keepGoing = true;
 
-    while (keepGoing) {
+    while (stats.processed < LIMIT) {
         batchNum++;
         const { shipments } = await fetchIncompleteShipments(lastId);
 
@@ -256,21 +269,29 @@ async function main() {
 
         log(`\n── Batch ${batchNum}: ${shipments.length} shipments (starting after id ${lastId || 'start'}) ──`);
 
+        // Batch-load all order numbers at once (eliminates N+1)
+        const orderIds = shipments.map(s => s.order_id).filter(Boolean);
+        await batchLoadOrderNumbers(orderIds);
+
         for (const shipment of shipments) {
+            if (stats.processed >= LIMIT) break;
             stats.processed++;
             lastId = shipment.id;
 
-            // 1. Get order number
-            const orderNumber = await getOrderNumber(shipment.order_id);
+            // 1. Get order number (from cache, loaded in batch above)
+            const orderNumber = getOrderNumber(shipment.order_id);
             if (!orderNumber) {
                 stats.skipped++;
                 continue;
             }
 
-            // 2. Search ShipStation
+            // 2. Search ShipStation (cached per order number)
             let ssShipments;
             try {
-                ssShipments = await findShipStationMatch(orderNumber);
+                if (!ssCache[orderNumber]) {
+                    ssCache[orderNumber] = await findShipStationMatch(orderNumber);
+                }
+                ssShipments = ssCache[orderNumber];
             } catch (e) {
                 log(`  ⚠ SS lookup failed for ${orderNumber}: ${e.message}`);
                 stats.errors++;
@@ -314,7 +335,8 @@ async function main() {
         }
 
         // Progress log
-        log(`  Progress: ${stats.processed} processed | ${stats.matched} matched | ${stats.updated} updated | ${stats.not_found} not found | ${stats.errors} errors | rate_limit=${rateLimitRemaining}`);
+        const pct = totalRemaining ? ((stats.processed / Math.min(totalRemaining, LIMIT)) * 100).toFixed(1) : '?';
+        log(`  Progress: ${stats.processed}/${Math.min(totalRemaining || 0, LIMIT)} (${pct}%) | matched=${stats.matched} updated=${stats.updated} not_found=${stats.not_found} errors=${stats.errors} | SS rate_limit=${rateLimitRemaining}`);
     }
 
     // Final cursor save
