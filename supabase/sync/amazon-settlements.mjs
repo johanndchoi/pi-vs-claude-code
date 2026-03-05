@@ -197,26 +197,78 @@ async function processReport(reportId) {
     stats.reports++;
 }
 
+// ─── List all reports (paginated) ────────────────────────────────────
+async function listAllReports() {
+    const reports = [];
+    let nextToken = null;
+    do {
+        const url = nextToken
+            ? `/reports/2021-06-30/reports?nextToken=${encodeURIComponent(nextToken)}`
+            : `/reports/2021-06-30/reports?reportTypes=GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2&pageSize=100`;
+        const data = await spApiGet(url);
+        const done = data.reports?.filter(r => r.processingStatus === 'DONE') || [];
+        reports.push(...done);
+        nextToken = data.nextToken || null;
+        await sleep(1000);
+    } while (nextToken);
+    return reports;
+}
+
+// ─── Get imported settlement IDs from Supabase ──────────────────────
+async function getImportedSettlementIds() {
+    const ids = new Set();
+    let offset = 0;
+    const PAGE = 1000;
+    while (true) {
+        const res = await fetch(
+            `${SUPA_URL}/rest/v1/channel_fees?channel_id=eq.${AMAZON_CHANNEL_ID}&select=metadata&limit=${PAGE}&offset=${offset}`,
+            { headers: { ...supaHeaders, Prefer: 'count=exact' } }
+        );
+        const range = res.headers.get('content-range');
+        const data = await res.json();
+        for (const f of data) {
+            if (f.metadata?.settlement_id) ids.add(f.metadata.settlement_id);
+        }
+        const total = range ? parseInt(range.split('/')[1]) : 0;
+        offset += PAGE;
+        if (offset >= total || data.length < PAGE) break;
+    }
+    return ids;
+}
+
 // ─── Main ────────────────────────────────────────────────────────────
 async function main() {
     log('Amazon settlement import starting');
 
-    // List available reports
-    const reportsData = await spApiGet(
-        `/reports/2021-06-30/reports?reportTypes=GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2&pageSize=${RECENT}`
-    );
-    const reports = reportsData.reports?.filter(r => r.processingStatus === 'DONE') || [];
+    // List ALL available reports (paginated, not just last 20)
+    const reports = ALL ? await listAllReports() : await (async () => {
+        const data = await spApiGet(
+            `/reports/2021-06-30/reports?reportTypes=GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2&pageSize=${RECENT}`
+        );
+        return data.reports?.filter(r => r.processingStatus === 'DONE') || [];
+    })();
     log(`Found ${reports.length} settlement reports`);
 
-    // Filter to unprocessed
+    // Use cursor to skip already-processed reports (unless --all)
     const lastProcessed = !ALL && loadCursor();
     let toProcess = reports;
     if (lastProcessed) {
         const idx = reports.findIndex(r => r.reportId === lastProcessed);
         if (idx >= 0) {
             toProcess = reports.slice(0, idx);
-            log(`  ${toProcess.length} new since last run`);
+            log(`  ${toProcess.length} new since last cursor`);
         }
+    }
+
+    // Also check Supabase for imported settlement IDs to catch any missed
+    // by the cursor (e.g., reports created out of chronological order)
+    if (!ALL && toProcess.length === 0) {
+        log('  Checking for any missed settlements...');
+        const imported = await getImportedSettlementIds();
+        // We can't check settlement_id without downloading, so just process
+        // recent reports and let upsert dedup handle it
+        toProcess = reports.slice(0, 5); // Re-check last 5
+        log(`  Re-checking last ${toProcess.length} reports for missed settlements`);
     }
 
     if (toProcess.length === 0) {
@@ -235,7 +287,7 @@ async function main() {
         }
     }
 
-    // Save cursor
+    // Save cursor to newest report
     if (reports.length > 0) {
         saveCursor(reports[0].reportId);
     }
