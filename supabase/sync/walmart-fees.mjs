@@ -40,7 +40,7 @@ const WM_CLIENT_SECRET = execSync('op read "op://Agents Service Accounts/Walmart
 const WALMART_CHANNEL_ID = '2da7e1e0-579e-4968-bdef-fa18492a6a86';
 const CURSOR_FILE = join(__dirname, '..', '.locks', 'walmart-fees.cursor');
 
-const stats = { reports: 0, fees_created: 0, skipped: 0, matched: 0, unmatched: 0, errors: 0 };
+const stats = { reports: 0, fees_created: 0, skipped: 0, matched: 0, unmatched: 0, errors: 0, estimated_replaced: 0 };
 function log(msg) { console.log(`[${new Date().toLocaleTimeString()}] ${msg}`); }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -103,6 +103,7 @@ function parseCSV(content) {
 // ─── Supabase helpers ────────────────────────────────────────────────
 const supaH = { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` };
 const orderCache = {};
+const estimatedCleaned = new Set();
 
 async function findOrderId(orderNum) {
     if (orderCache[orderNum] !== undefined) return orderCache[orderNum];
@@ -123,6 +124,21 @@ async function upsertFee(data) {
     if (body.includes('23505') || body.includes('duplicate')) { stats.skipped++; return true; }
     stats.errors++;
     return false;
+}
+
+async function removeEstimatedFees(orderId) {
+    // Remove placeholder fees (wm-estimated-*) when actual recon data arrives
+    const res = await fetch(
+        `${SUPA_URL}/rest/v1/channel_fees?order_id=eq.${orderId}&external_ref=like.wm-estimated-*`,
+        { method: 'DELETE', headers: { ...supaH, Prefer: 'return=representation' } }
+    );
+    if (res.ok) {
+        const removed = await res.json();
+        if (removed.length) {
+            log(`    ✓ Removed ${removed.length} estimated fee(s) for order ${orderId}`);
+            stats.estimated_replaced += removed.length;
+        }
+    }
 }
 
 // ─── Fee type mapping ────────────────────────────────────────────────
@@ -239,6 +255,12 @@ async function main() {
                 if (!orderId) { stats.unmatched++; continue; }
                 stats.matched++;
 
+                // Remove any estimated placeholder fees now that we have real recon data
+                if (!estimatedCleaned.has(orderId)) {
+                    await removeEstimatedFees(orderId);
+                    estimatedCleaned.add(orderId);
+                }
+
                 const txKey = row['Transaction Key'] || `${reportDate}-${orderNum}-${row['Customer Order line #']}`;
                 const externalRef = `wm-${txKey}-${amountType.replace(/\s+/g, '')}`;
 
@@ -291,6 +313,7 @@ async function main() {
     log(`  Skipped dupes: ${stats.skipped}`);
     log(`  Orders matched: ${stats.matched}`);
     log(`  Unmatched:     ${stats.unmatched}`);
+    log(`  Est. replaced: ${stats.estimated_replaced}`);
     log(`  Errors:        ${stats.errors}`);
 }
 
