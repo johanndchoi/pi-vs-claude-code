@@ -1,27 +1,29 @@
 #!/usr/bin/env node
 
 /**
- * Amazon SP-API → Supabase Order Enrichment (Optimized)
- * Fills in tax_amount, shipping_cost, discount_amount, total from Amazon SP-API.
- * Falls back to ShipStation V1 API when SP-API returns no tax data.
+ * Amazon Order Tax Enrichment → Supabase
+ * Backfills tax_amount for Amazon orders using SP-API GetOrderItems,
+ * with ShipStation V1 fallback when SP-API returns zero tax.
  *
- * Optimizations over original:
- *   - Batch GetOrders (up to 50 IDs) to skip per-order GetOrder calls
- *   - ShipStation V1 fallback for orders where SP-API has no tax
- *   - Cursor-based resume (picks up where it left off)
- *   - Newest-first processing (most valuable for current reporting)
- *   - Progress logging with ETA
+ * Strategy:
+ *   1. Query Supabase for Amazon orders with tax_amount=0 (newest first)
+ *   2. Batch fetch order-level data via SP-API GetOrders (up to 50 per call)
+ *   3. For each order, call GetOrderItems to get line-item tax
+ *   4. If SP-API returns 0 tax, cross-check ShipStation V1 API
+ *   5. Save cursor so we resume where we left off
  *
  * Usage:
- *   node amazon-enrich.mjs                  # Enrich orders with tax=0
- *   node amazon-enrich.mjs --all            # Re-enrich all Amazon orders
- *   node amazon-enrich.mjs --since 2026-01  # Only orders after date
- *   node amazon-enrich.mjs --dry-run        # Preview without writing
- *   node amazon-enrich.mjs --limit 10       # Process only N orders (for testing)
- *   node amazon-enrich.mjs --reset-cursor   # Clear saved cursor, start fresh
+ *   node amazon-enrich.mjs                # Enrich all (resumes from cursor)
+ *   node amazon-enrich.mjs --batch 10     # Process only 10 orders
+ *   node amazon-enrich.mjs --reset        # Reset cursor, start from newest
+ *   node amazon-enrich.mjs --dry-run      # Preview without writing
+ *
+ * SP-API rate limits:
+ *   GetOrders:     0.0167 req/s burst 20 (batches of 50 IDs)
+ *   GetOrderItems: 0.5 req/s burst 30
  */
 
-import { readFileSync, mkdirSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { execSync } from 'child_process';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -29,18 +31,20 @@ import { fileURLToPath } from 'url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const DRY_RUN = args.includes('--dry-run');
-const ALL = args.includes('--all');
-const SINCE = args.find((_, i) => args[i - 1] === '--since');
-const LIMIT = parseInt(args.find((_, i) => args[i - 1] === '--limit') || '0') || 0;
-const RESET_CURSOR = args.includes('--reset-cursor');
+const RESET = args.includes('--reset');
+const batchArg = args.find((_, i) => args[i - 1] === '--batch');
+const BATCH_SIZE = batchArg ? parseInt(batchArg) : null; // null = all
 
-// ─── Environment ─────────────────────────────────────────────────────
+const CURSOR_FILE = join(__dirname, '..', '.locks', 'amazon-enrich.cursor.json');
+const AMAZON_CHANNEL_ID = '7f84462f-86c8-4e09-abb6-285631db0d83';
+
+// ─── Credentials ─────────────────────────────────────────────────────
 function loadEnv() {
     try {
         const content = readFileSync(join(__dirname, '..', '.env.local'), 'utf8');
         for (const line of content.split('\n')) {
-            const m = line.match(/^([^#=]+)=(.*)$/);
-            if (m && !process.env[m[1].trim()]) process.env[m[1].trim()] = m[2].trim();
+            const m = line.match(/^(\w+)=(.+)$/);
+            if (m) process.env[m[1]] = m[2];
         }
     } catch {}
 }
@@ -50,155 +54,190 @@ const SUPA_URL = process.env.SUPABASE_API_URL;
 const SUPA_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 if (!SUPA_URL || !SUPA_KEY) { console.error('Missing Supabase credentials'); process.exit(1); }
 
-// ─── 1Password credential loader ────────────────────────────────────
-const op = (ref) => execSync(`op read "${ref}"`, {
-    encoding: 'utf8',
-    env: { ...process.env, OP_SERVICE_ACCOUNT_TOKEN: process.env.OP_SERVICE_ACCOUNT_TOKEN }
-}).trim();
+function opRead(ref) {
+    return execSync(`op read "${ref}"`, { encoding: 'utf8', env: { ...process.env } }).trim();
+}
 
-// Amazon SP-API credentials
-const LWA_CLIENT_ID = op('op://Agents Service Accounts/Amazon SP-API Credentials/LWACredentials');
-const LWA_CLIENT_SECRET = op('op://Agents Service Accounts/Amazon SP-API Credentials/ClientSecret');
-const REFRESH_TOKEN = op('op://Agents Service Accounts/Amazon SP-API Credentials/SellerRefreshToken');
+// Amazon SP-API creds
+const AMZ_CLIENT_ID = opRead('op://Agents Service Accounts/Amazon SP-API Credentials/LWACredentials');
+const AMZ_CLIENT_SECRET = opRead('op://Agents Service Accounts/Amazon SP-API Credentials/ClientSecret');
+const AMZ_REFRESH_TOKEN = opRead('op://Agents Service Accounts/Amazon SP-API Credentials/SellerRefreshToken');
+const AMZ_MARKETPLACE = opRead('op://Agents Service Accounts/Amazon SP-API Credentials/MarketplaceId');
 
-// ShipStation V1 credentials (fallback)
-const SS_KEY = process.env.SS_V1_KEY ||
-    op('op://Agents Service Accounts/Shipstation v1 API Credential/API Key');
-const SS_SECRET = process.env.SS_V1_SECRET ||
-    op('op://Agents Service Accounts/Shipstation v1 API Credential/API Secret');
+// ShipStation V1 creds
+const SS_KEY = opRead('op://Agents Service Accounts/Shipstation v1 API Credential/API Key');
+const SS_SECRET = opRead('op://Agents Service Accounts/Shipstation v1 API Credential/API Secret');
 const SS_AUTH = 'Basic ' + Buffer.from(`${SS_KEY}:${SS_SECRET}`).toString('base64');
 
-const AMAZON_CHANNEL_ID = '7f84462f-86c8-4e09-abb6-285631db0d83';
-const SP_API_BASE = 'https://sellingpartnerapi-na.amazon.com';
-const MARKETPLACE_ID = 'ATVPDKIKX0DER'; // US marketplace
-
+// ─── Stats ───────────────────────────────────────────────────────────
 const stats = {
-    checked: 0, enriched: 0, items_updated: 0,
-    skipped: 0, api_errors: 0, errors: 0,
-    ss_fallback: 0, ss_enriched: 0
+    total_pending: 0,
+    processed: 0,
+    enriched_spapi: 0,
+    enriched_shipstation: 0,
+    still_zero: 0,
+    already_done: 0,
+    errors: 0,
+    total_tax_found: 0
 };
-const startTime = Date.now();
-let totalToProcess = 0;
 
 function log(msg) { console.log(`[${new Date().toLocaleTimeString()}] ${msg}`); }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ─── Token Management ────────────────────────────────────────────────
-let accessToken = null;
-let tokenExpiry = 0;
+// ─── Cursor management ──────────────────────────────────────────────
+function loadCursor() {
+    if (RESET) return null;
+    try {
+        if (existsSync(CURSOR_FILE)) {
+            return JSON.parse(readFileSync(CURSOR_FILE, 'utf8'));
+        }
+    } catch {}
+    return null;
+}
 
-async function getAccessToken() {
-    if (accessToken && Date.now() < tokenExpiry) return accessToken;
+function saveCursor(data) {
+    if (DRY_RUN) return;
+    writeFileSync(CURSOR_FILE, JSON.stringify({
+        ...data,
+        updated_at: new Date().toISOString()
+    }, null, 2));
+}
+
+// ─── Amazon SP-API Auth ──────────────────────────────────────────────
+let amzAccessToken = null;
+let amzTokenExpiry = 0;
+
+async function amzAuth() {
+    if (amzAccessToken && Date.now() < amzTokenExpiry) return amzAccessToken;
+
     const res = await fetch('https://api.amazon.com/auth/o2/token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: `grant_type=refresh_token&refresh_token=${REFRESH_TOKEN}&client_id=${LWA_CLIENT_ID}&client_secret=${LWA_CLIENT_SECRET}`
+        body: new URLSearchParams({
+            grant_type: 'refresh_token',
+            refresh_token: AMZ_REFRESH_TOKEN,
+            client_id: AMZ_CLIENT_ID,
+            client_secret: AMZ_CLIENT_SECRET
+        })
     });
+
+    if (!res.ok) throw new Error(`Amazon auth failed: ${res.status} ${await res.text()}`);
     const data = await res.json();
-    if (!data.access_token) throw new Error('Token failed: ' + JSON.stringify(data));
-    accessToken = data.access_token;
-    tokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
-    return accessToken;
+    amzAccessToken = data.access_token;
+    amzTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+    return amzAccessToken;
 }
 
-// ─── SP-API Helpers ──────────────────────────────────────────────────
-let rateLimitWait = 0;
+// ─── SP-API rate-limited fetch ───────────────────────────────────────
+async function spApiGet(path, retries = 3) {
+    const token = await amzAuth();
+    const url = `https://sellingpartnerapi-na.amazon.com${path}`;
 
-async function spApiGet(path) {
-    const token = await getAccessToken();
-    const res = await fetch(`${SP_API_BASE}${path}`, {
-        headers: { 'x-amz-access-token': token }
-    });
-
-    if (res.status === 429) {
-        rateLimitWait = Math.min(60, (rateLimitWait || 5) * 2);
-        log(`  ⏳ Rate limited, waiting ${rateLimitWait}s...`);
-        await sleep(rateLimitWait * 1000);
-        return spApiGet(path);
-    }
-    rateLimitWait = Math.max(0, rateLimitWait - 1);
-
-    if (res.status === 403 || res.status === 404) return null;
-    if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`SP-API ${res.status}: ${body}`);
-    }
-    return res.json();
-}
-
-/**
- * Batch fetch orders from SP-API (up to 50 at a time).
- * Returns a Map of orderNumber → Order object.
- */
-async function batchGetOrders(orderNumbers) {
-    const map = new Map();
-    // SP-API supports up to 50 AmazonOrderIds per request
-    for (let i = 0; i < orderNumbers.length; i += 50) {
-        const batch = orderNumbers.slice(i, i + 50);
-        const ids = batch.join(',');
-        const data = await spApiGet(
-            `/orders/v0/orders?MarketplaceIds=${MARKETPLACE_ID}&AmazonOrderIds=${ids}`
-        );
-        if (data?.payload?.Orders) {
-            for (const order of data.payload.Orders) {
-                map.set(order.AmazonOrderId, order);
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        const res = await fetch(url, {
+            headers: {
+                'x-amz-access-token': token,
+                'Content-Type': 'application/json'
             }
+        });
+
+        if (res.status === 429) {
+            const wait = Math.min(2 ** attempt * 2, 30);
+            log(`  ⏳ SP-API 429, retry ${attempt}/${retries} in ${wait}s...`);
+            await sleep(wait * 1000);
+            continue;
         }
-        // Rate limit: ~1 req/sec for getOrders
-        if (i + 50 < orderNumbers.length) await sleep(1100);
+        if (res.status === 403) {
+            // Token might have expired mid-batch
+            amzAccessToken = null;
+            const newToken = await amzAuth();
+            const retry = await fetch(url, {
+                headers: { 'x-amz-access-token': newToken, 'Content-Type': 'application/json' }
+            });
+            if (!retry.ok) throw new Error(`SP-API ${retry.status}: ${await retry.text()}`);
+            return retry.json();
+        }
+        if (!res.ok) {
+            const body = await res.text();
+            throw new Error(`SP-API ${res.status}: ${body.slice(0, 300)}`);
+        }
+        return res.json();
     }
-    return map;
+    throw new Error('SP-API: max retries exceeded');
 }
 
-// ─── ShipStation V1 Fallback ─────────────────────────────────────────
-let ssRateBucket = 40; // SS V1 allows 40 req/60s
-let ssLastReset = Date.now();
+// ─── SP-API: GetOrderItems ──────────────────────────────────────────
+async function getOrderItemsTax(orderId) {
+    // GetOrderItems rate: 0.5 req/s, burst 30
+    // We pace at ~1.5s between calls to stay safe
+    const data = await spApiGet(`/orders/v0/orders/${orderId}/orderItems`);
+    const items = data?.payload?.OrderItems || [];
+
+    let totalTax = 0;
+    const lineItems = [];
+
+    for (const item of items) {
+        const itemTax = parseFloat(item.ItemTax?.Amount || '0');
+        const shippingTax = parseFloat(item.ShippingTax?.Amount || '0');
+        const lineTax = itemTax + shippingTax;
+        totalTax += lineTax;
+        lineItems.push({
+            asin: item.ASIN,
+            sku: item.SellerSKU,
+            quantity: item.QuantityOrdered,
+            item_tax: itemTax,
+            shipping_tax: shippingTax,
+            total_tax: +lineTax.toFixed(2)
+        });
+    }
+
+    return { totalTax: +totalTax.toFixed(2), lineItems };
+}
+
+// ─── ShipStation V1 fallback ─────────────────────────────────────────
+let ssRateLimitRemaining = 40;
 
 async function ssGet(path) {
-    // Simple rate limiter: 40 req / 60s
-    const now = Date.now();
-    if (now - ssLastReset > 60000) {
-        ssRateBucket = 40;
-        ssLastReset = now;
+    if (ssRateLimitRemaining <= 2) {
+        log('  ⏳ ShipStation rate limit pause (11s)...');
+        await sleep(11000);
+        ssRateLimitRemaining = 40;
     }
-    if (ssRateBucket <= 1) {
-        const waitMs = 60000 - (now - ssLastReset) + 500;
-        log(`  ⏳ ShipStation rate limit, waiting ${(waitMs / 1000).toFixed(0)}s...`);
-        await sleep(waitMs);
-        ssRateBucket = 40;
-        ssLastReset = Date.now();
-    }
-    ssRateBucket--;
 
     const res = await fetch(`https://ssapi.shipstation.com${path}`, {
         headers: { Authorization: SS_AUTH }
     });
+
+    const remaining = res.headers.get('x-rate-limit-remaining');
+    if (remaining != null) ssRateLimitRemaining = parseInt(remaining);
+
+    if (res.status === 429) {
+        const reset = parseInt(res.headers.get('x-rate-limit-reset') || '10');
+        log(`  ⏳ ShipStation 429, waiting ${reset + 1}s...`);
+        await sleep((reset + 1) * 1000);
+        ssRateLimitRemaining = 40;
+        return ssGet(path);
+    }
     if (!res.ok) {
-        if (res.status === 429) {
-            await sleep(15000);
-            return ssGet(path);
-        }
-        return null;
+        if (res.status === 404) return null;
+        throw new Error(`ShipStation ${res.status}: ${await res.text()}`);
     }
     return res.json();
 }
 
-/**
- * Try to get tax from ShipStation V1 for a given order number.
- * Returns { taxAmount } or null.
- */
 async function getShipStationTax(orderNumber) {
-    stats.ss_fallback++;
     const data = await ssGet(`/orders?orderNumber=${encodeURIComponent(orderNumber)}`);
-    if (!data?.orders?.length) return null;
-    const ssOrder = data.orders[0];
-    if (ssOrder.taxAmount && ssOrder.taxAmount > 0) {
-        return { taxAmount: +ssOrder.taxAmount.toFixed(2) };
+    if (!data?.orders?.length) return 0;
+
+    // Sum tax from all matching orders (usually 1)
+    let totalTax = 0;
+    for (const order of data.orders) {
+        totalTax += order.taxAmount || 0;
     }
-    return null;
+    return +totalTax.toFixed(2);
 }
 
-// ─── Supabase Helpers ────────────────────────────────────────────────
+// ─── Supabase helpers ────────────────────────────────────────────────
 async function supaGet(path) {
     const res = await fetch(`${SUPA_URL}/rest/v1/${path}`, {
         headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` }
@@ -208,261 +247,204 @@ async function supaGet(path) {
 
 async function supaGetWithCount(path) {
     const res = await fetch(`${SUPA_URL}/rest/v1/${path}`, {
-        headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, Prefer: 'count=exact' }
+        headers: {
+            apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`,
+            Prefer: 'count=exact'
+        }
     });
-    const count = parseInt(res.headers.get('content-range')?.split('/')[1] || '0');
+    const contentRange = res.headers.get('content-range');
+    const total = contentRange ? parseInt(contentRange.split('/')[1]) : null;
     const data = await res.json();
-    return { data, count };
+    return { data, total };
 }
 
-async function supaPatch(table, id, data) {
-    if (DRY_RUN) return true;
-    const res = await fetch(`${SUPA_URL}/rest/v1/${table}?id=eq.${id}`, {
+async function supaPatch(table, filter, data) {
+    if (DRY_RUN) return;
+    const res = await fetch(`${SUPA_URL}/rest/v1/${table}?${filter}`, {
         method: 'PATCH',
         headers: {
             apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`,
-            'Content-Type': 'application/json', Prefer: 'return=minimal'
+            'Content-Type': 'application/json',
+            Prefer: 'return=representation'
         },
         body: JSON.stringify(data)
     });
     if (!res.ok) {
         const body = await res.text();
-        log(`  ⚠ PATCH ${table} ${id}: ${res.status} ${body}`);
-        return false;
+        throw new Error(`PATCH ${table} ${res.status}: ${body.slice(0, 200)}`);
     }
-    return true;
+    return res.json();
 }
 
-// ─── Enrich a single order (with pre-fetched SP-API order data) ──────
-async function enrichOrder(order, amzOrderMap) {
-    const orderNum = order.order_number;
-    const amzOrder = amzOrderMap.get(orderNum);
+// ─── Fetch pending orders from Supabase ──────────────────────────────
+async function fetchPendingOrders(cursor) {
+    // Get total count first
+    const { total } = await supaGetWithCount(
+        `orders?channel_id=eq.${AMAZON_CHANNEL_ID}&tax_amount=eq.0&select=id&limit=1`
+    );
+    stats.total_pending = total || 0;
 
-    // Get order items for tax/shipping/discount breakdown (must be per-order)
-    const itemsData = await spApiGet(`/orders/v0/orders/${orderNum}/orderItems`);
-    if (!itemsData?.payload?.OrderItems) {
-        stats.api_errors++;
-        return;
-    }
-    const amzItems = itemsData.payload.OrderItems;
+    // Fetch orders newest first, paginated
+    // If we have a cursor, skip orders we've already processed
+    const limit = BATCH_SIZE || 1000; // Fetch in pages of 1000 max
+    let query = `orders?channel_id=eq.${AMAZON_CHANNEL_ID}&tax_amount=eq.0&select=id,order_number,ordered_at,tax_amount,external_ids&order=ordered_at.desc&limit=${limit}`;
 
-    // Calculate totals from line items
-    let totalTax = 0;
-    let totalShipping = 0;
-    let totalShippingTax = 0;
-    let totalDiscount = 0;
-    let totalShippingDiscount = 0;
-
-    for (const item of amzItems) {
-        totalTax += +(item.ItemTax?.Amount || 0);
-        totalShipping += +(item.ShippingPrice?.Amount || 0);
-        totalShippingTax += +(item.ShippingTax?.Amount || 0);
-        totalDiscount += +(item.PromotionDiscount?.Amount || 0);
-        totalShippingDiscount += +(item.ShippingDiscount?.Amount || 0);
+    // If cursor has a list of already-processed order IDs, we can't easily
+    // filter those via REST. Instead, we track by ordered_at cutoff.
+    if (cursor?.last_ordered_at) {
+        // Process orders older than cursor (we work newest → oldest)
+        query += `&ordered_at=lt.${encodeURIComponent(cursor.last_ordered_at)}`;
     }
 
-    const orderTotal = +(amzOrder?.OrderTotal?.Amount || 0);
+    const orders = await supaGet(query);
+    return Array.isArray(orders) ? orders : [];
+}
 
-    // Build order patch
-    const orderPatch = {};
-    if (totalTax > 0) orderPatch.tax_amount = +totalTax.toFixed(2);
-    if (totalShipping > 0) orderPatch.shipping_cost = +totalShipping.toFixed(2);
-    if (totalDiscount > 0) orderPatch.discount_amount = +(totalDiscount + totalShippingDiscount).toFixed(2);
-    if (orderTotal > 0) orderPatch.total = orderTotal;
+// ─── Process one order ───────────────────────────────────────────────
+async function enrichOrder(order, index, total) {
+    const { id, order_number, ordered_at } = order;
 
-    // If SP-API returned no tax, try ShipStation V1 as fallback
-    if (!orderPatch.tax_amount || orderPatch.tax_amount === 0) {
-        const ssTax = await getShipStationTax(orderNum);
-        if (ssTax) {
-            orderPatch.tax_amount = ssTax.taxAmount;
-            stats.ss_enriched++;
-        }
+    // Progress logging
+    const remaining = stats.total_pending - stats.processed;
+    if (index % 10 === 0 || index === total - 1) {
+        log(`[${stats.processed + 1} of ${stats.total_pending}] ${order_number} (${ordered_at?.split('T')[0]}) — ${remaining} remaining`);
     }
 
-    if (Object.keys(orderPatch).length > 0) {
-        const ok = await supaPatch('orders', order.id, orderPatch);
-        if (ok) stats.enriched++;
-        else stats.errors++;
-    } else {
-        stats.skipped++;
-    }
+    try {
+        // Step 1: Try SP-API GetOrderItems
+        let tax = 0;
+        let source = null;
+        let lineItems = [];
 
-    // Update order_items with per-item tax/shipping
-    if (order.order_items?.length) {
-        for (const dbItem of order.order_items) {
-            const sku = dbItem.sku;
-            const amzItem = amzItems.find(ai =>
-                ai.SellerSKU === sku ||
-                ai.ASIN === dbItem.metadata?.amazon_asin
-            );
-            if (!amzItem) continue;
-
-            const itemPatch = {};
-            const itemTax = +(amzItem.ItemTax?.Amount || 0);
-            const itemDiscount = +(amzItem.PromotionDiscount?.Amount || 0);
-
-            if (itemTax > 0) itemPatch.tax_amount = itemTax;
-            if (itemDiscount > 0) itemPatch.discount_amount = itemDiscount;
-
-            if (Object.keys(itemPatch).length > 0) {
-                const ok = await supaPatch('order_items', dbItem.id, itemPatch);
-                if (ok) stats.items_updated++;
+        try {
+            const result = await getOrderItemsTax(order_number);
+            tax = result.totalTax;
+            lineItems = result.lineItems;
+            if (tax > 0) source = 'sp-api';
+        } catch (e) {
+            if (e.message.includes('InvalidInput') || e.message.includes('not found')) {
+                // Order not in SP-API (might be old), try ShipStation
+            } else {
+                throw e;
             }
         }
+
+        // Step 2: If SP-API returned 0, try ShipStation
+        if (tax === 0) {
+            try {
+                tax = await getShipStationTax(order_number);
+                if (tax > 0) source = 'shipstation';
+            } catch (e) {
+                log(`  ⚠ ShipStation fallback failed for ${order_number}: ${e.message}`);
+            }
+        }
+
+        // Step 3: Update Supabase
+        if (tax > 0) {
+            const existingExtIds = order.external_ids || {};
+            const updates = {
+                tax_amount: tax,
+                external_ids: {
+                    ...existingExtIds,
+                    tax_source: source,
+                    ...(lineItems.length ? { amazon_tax_details: lineItems } : {})
+                }
+            };
+
+            await supaPatch('orders', `id=eq.${id}`, updates);
+
+            if (source === 'sp-api') stats.enriched_spapi++;
+            else stats.enriched_shipstation++;
+            stats.total_tax_found += tax;
+        } else {
+            // Mark as checked so we don't re-process endlessly
+            // We still leave tax_amount=0 but note we checked
+            const existingExtIds = order.external_ids || {};
+            if (!existingExtIds.tax_checked) {
+                await supaPatch('orders', `id=eq.${id}`, {
+                    external_ids: { ...existingExtIds, tax_checked: new Date().toISOString() }
+                });
+            }
+            stats.still_zero++;
+        }
+
+        stats.processed++;
+
+        // Pace for SP-API GetOrderItems (0.5 req/s, burst 30)
+        // ~1.5s between calls keeps us well under limits
+        await sleep(1500);
+
+    } catch (e) {
+        log(`  ⚠ ${order_number}: ${e.message}`);
+        stats.errors++;
+        stats.processed++;
+
+        // On rate limit errors, back off more
+        if (e.message.includes('429') || e.message.includes('QuotaExceeded')) {
+            log('  ⏳ Backing off 30s...');
+            await sleep(30000);
+        }
     }
-}
-
-// ─── Cursor management ───────────────────────────────────────────────
-const CURSOR_DIR = join(__dirname, '..', '.locks');
-const CURSOR_FILE = join(CURSOR_DIR, 'amazon-enrich.cursor.json');
-
-function loadCursor() {
-    try {
-        const raw = readFileSync(CURSOR_FILE, 'utf8');
-        return JSON.parse(raw);
-    } catch {
-        return null;
-    }
-}
-
-function saveCursor(data) {
-    mkdirSync(CURSOR_DIR, { recursive: true });
-    writeFileSync(CURSOR_FILE, JSON.stringify({
-        ...data,
-        updated_at: new Date().toISOString()
-    }, null, 2));
-}
-
-function clearCursor() {
-    try { writeFileSync(CURSOR_FILE, '{}'); } catch {}
-}
-
-// ─── Progress Display ────────────────────────────────────────────────
-function logProgress() {
-    const elapsed = (Date.now() - startTime) / 1000;
-    const rate = stats.checked / elapsed;
-    const remaining = totalToProcess - stats.checked;
-    const eta = rate > 0 ? remaining / rate : 0;
-    const etaMin = Math.ceil(eta / 60);
-
-    log(`  📊 ${stats.checked} of ${totalToProcess} orders enriched, ${remaining} remaining | ` +
-        `${stats.enriched} enriched, ${stats.ss_enriched} via ShipStation | ` +
-        `ETA: ${etaMin}m | ${rate.toFixed(1)} orders/sec`);
 }
 
 // ─── Main ────────────────────────────────────────────────────────────
 async function main() {
-    log('Amazon SP-API order enrichment starting (optimized)');
+    log('Starting Amazon order tax enrichment');
     if (DRY_RUN) log('*** DRY RUN ***');
-    if (LIMIT) log(`*** LIMITED TO ${LIMIT} ORDERS ***`);
+    if (BATCH_SIZE) log(`Batch size: ${BATCH_SIZE}`);
 
-    if (RESET_CURSOR) {
-        clearCursor();
-        log('Cursor reset');
+    // Load cursor
+    let cursor = loadCursor();
+    if (cursor) {
+        log(`Resuming from cursor: processed ${cursor.total_processed || 0} orders, last_ordered_at=${cursor.last_ordered_at || 'none'}`);
+    } else {
+        log('Starting fresh (no cursor)');
     }
 
-    // Load cursor for resume
-    const cursor = loadCursor();
-    let cursorOrderedAt = cursor?.last_ordered_at || null;
+    // Fetch pending orders
+    const orders = await fetchPendingOrders(cursor);
+    const toProcess = BATCH_SIZE ? orders.slice(0, BATCH_SIZE) : orders;
 
-    // Build query for Amazon orders needing enrichment
-    let filter = `channel_id=eq.${AMAZON_CHANNEL_ID}`;
-    if (!ALL) filter += '&tax_amount=eq.0';
-    if (SINCE) filter += `&ordered_at=gte.${SINCE}`;
+    log(`Found ${stats.total_pending} total orders with tax_amount=0`);
+    log(`Processing ${toProcess.length} orders (newest first)`);
 
-    // If we have a cursor (and no explicit --since), resume from where we left off
-    // Since we process newest-first (desc), cursor means "skip orders newer than this"
-    if (cursorOrderedAt && !SINCE && !ALL && !RESET_CURSOR) {
-        filter += `&ordered_at=lte.${cursorOrderedAt}`;
-        log(`  Resuming from cursor: ${cursorOrderedAt}`);
-    }
-
-    // Get total count
-    const { count: totalCount } = await supaGetWithCount(
-        `orders?${filter}&select=id`
-    );
-    totalToProcess = LIMIT ? Math.min(LIMIT, totalCount) : totalCount;
-    log(`  ${totalCount} orders need enrichment${LIMIT ? `, processing ${totalToProcess}` : ''}`);
-
-    if (totalToProcess === 0) {
-        log('Nothing to do!');
+    if (toProcess.length === 0) {
+        log('Nothing to process!');
         return;
     }
 
-    let offset = 0;
-    const PAGE_SIZE = 50; // Match SP-API batch size
+    // Process orders
+    for (let i = 0; i < toProcess.length; i++) {
+        await enrichOrder(toProcess[i], i, toProcess.length);
 
-    while (stats.checked < totalToProcess) {
-        // Fetch a page of orders from Supabase (newest first)
-        const orders = await supaGet(
-            `orders?${filter}&select=id,order_number,ordered_at,tax_amount,shipping_cost,total,order_items(id,sku,metadata)` +
-            `&limit=${PAGE_SIZE}&offset=${offset}&order=ordered_at.desc`
-        );
-        if (!orders.length) break;
-
-        // Batch-fetch order-level data from SP-API (up to 50 at once)
-        const orderNumbers = orders.map(o => o.order_number);
-        let amzOrderMap;
-        try {
-            amzOrderMap = await batchGetOrders(orderNumbers);
-        } catch (e) {
-            log(`  ⚠ Batch GetOrders failed: ${e.message}`);
-            amzOrderMap = new Map();
+        // Save cursor every 50 orders
+        if ((i + 1) % 50 === 0 || i === toProcess.length - 1) {
+            const lastOrder = toProcess[i];
+            saveCursor({
+                last_ordered_at: lastOrder.ordered_at,
+                last_order_number: lastOrder.order_number,
+                total_processed: (cursor?.total_processed || 0) + stats.processed,
+                last_batch_stats: { ...stats }
+            });
         }
-
-        // Process each order (still need per-order GetOrderItems call)
-        for (const order of orders) {
-            if (LIMIT && stats.checked >= LIMIT) break;
-            stats.checked++;
-
-            try {
-                await enrichOrder(order, amzOrderMap);
-            } catch (e) {
-                log(`  ⚠ ${order.order_number}: ${e.message}`);
-                stats.errors++;
-            }
-
-            // Save cursor after each order (the oldest ordered_at we've processed)
-            if (order.ordered_at) {
-                saveCursor({
-                    last_ordered_at: order.ordered_at,
-                    last_order_number: order.order_number,
-                    stats: { ...stats }
-                });
-            }
-
-            // SP-API rate limit for getOrderItems: ~0.5 req/sec
-            // We eliminated the per-order getOrder call, so only need ~2s between orders
-            await sleep(2000);
-
-            // Progress every 25 orders
-            if (stats.checked % 25 === 0) logProgress();
-        }
-
-        if (LIMIT && stats.checked >= LIMIT) break;
-        offset += orders.length;
     }
 
-    // Final progress
-    logProgress();
+    // Final summary
     log('────────────────────────────────────');
-    log(`Done! Checked ${stats.checked} Amazon orders:`);
-    log(`  Enriched (SP-API):     ${stats.enriched - stats.ss_enriched}`);
-    log(`  Enriched (ShipStation): ${stats.ss_enriched} (of ${stats.ss_fallback} fallback attempts)`);
-    log(`  Total enriched:        ${stats.enriched}`);
-    log(`  Items updated:         ${stats.items_updated}`);
-    log(`  Skipped (no data):     ${stats.skipped}`);
-    log(`  API errors:            ${stats.api_errors}`);
-    log(`  DB errors:             ${stats.errors}`);
+    log('Amazon tax enrichment complete!');
+    log(`  Total pending:           ${stats.total_pending}`);
+    log(`  Processed this run:      ${stats.processed}`);
+    log(`  Enriched via SP-API:     ${stats.enriched_spapi}`);
+    log(`  Enriched via ShipStation: ${stats.enriched_shipstation}`);
+    log(`  Still zero (no tax):     ${stats.still_zero}`);
+    log(`  Errors:                  ${stats.errors}`);
+    log(`  Total tax found:         $${stats.total_tax_found.toFixed(2)}`);
 
-    // Save final cursor (read back the latest per-order cursor for last_ordered_at)
-    const latestCursor = loadCursor();
-    saveCursor({
-        last_ordered_at: latestCursor?.last_ordered_at || null,
-        last_order_number: latestCursor?.last_order_number || null,
-        completed_at: new Date().toISOString(),
-        stats: { ...stats }
-    });
+    const enriched = stats.enriched_spapi + stats.enriched_shipstation;
+    const remaining = stats.total_pending - stats.processed;
+    log(`  ${enriched} of ${stats.processed} orders enriched, ${remaining} remaining`);
+
+    if (stats.errors > 0) process.exit(1);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });

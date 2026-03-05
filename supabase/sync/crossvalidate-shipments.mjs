@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 
 /**
- * Cross-validate Shipments: Veeqo (Supabase) ↔ ShipStation
+ * Cross-Validate Shipments: Veeqo ↔ ShipStation
  *
- * Finds shipments missing label_cost or tracking_number, then looks up
- * the matching ShipStation shipment by order_number and enriches them.
+ * Finds Supabase shipments missing label_cost or tracking_number,
+ * looks up corresponding orders in ShipStation V1, and backfills
+ * missing fields (cost, carrier, tracking, dates).
  *
  * Usage:
- *   node crossvalidate-shipments.mjs              # Run enrichment
- *   node crossvalidate-shipments.mjs --dry-run     # Preview only
- *   node crossvalidate-shipments.mjs --reset       # Clear cursor, start over
- *   node crossvalidate-shipments.mjs --limit 100   # Process N shipments max
+ *   node crossvalidate-shipments.mjs              # Full run
+ *   node crossvalidate-shipments.mjs --dry-run    # Preview only
+ *   node crossvalidate-shipments.mjs --reset      # Clear cursor, start fresh
  */
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
@@ -22,11 +22,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const DRY_RUN = args.includes('--dry-run');
 const RESET = args.includes('--reset');
-const limitArg = args.find((_, i) => args[i - 1] === '--limit');
-const BATCH_LIMIT = limitArg ? parseInt(limitArg) : null;
 
-const CURSOR_DIR = join(__dirname, '..', '.locks');
-const CURSOR_FILE = join(CURSOR_DIR, 'crossvalidate-shipments.cursor');
+const CURSOR_FILE = join(__dirname, '..', '.locks', 'crossvalidate-shipments.cursor');
+const BATCH_SIZE = 100;
 
 // ─── Credentials ─────────────────────────────────────────────────────
 function loadEnv() {
@@ -40,32 +38,20 @@ function loadEnv() {
 }
 loadEnv();
 
-function getSSCredentials() {
-    const key = process.env.SS_V1_KEY ||
-        execSync('op read "op://Agents Service Accounts/Shipstation v1 API Credential/API Key"', { encoding: 'utf8' }).trim();
-    const secret = process.env.SS_V1_SECRET ||
-        execSync('op read "op://Agents Service Accounts/Shipstation v1 API Credential/API Secret"', { encoding: 'utf8' }).trim();
-    return 'Basic ' + Buffer.from(`${key}:${secret}`).toString('base64');
-}
+const opExec = cmd => execSync(cmd, { encoding: 'utf8', env: { ...process.env } }).trim();
 
-const SS_AUTH = getSSCredentials();
+const SS_KEY = opExec('op read "op://Agents Service Accounts/Shipstation v1 API Credential/API Key"');
+const SS_SECRET = opExec('op read "op://Agents Service Accounts/Shipstation v1 API Credential/API Secret"');
+const SS_AUTH = 'Basic ' + Buffer.from(`${SS_KEY}:${SS_SECRET}`).toString('base64');
+
 const SUPA_URL = process.env.SUPABASE_API_URL;
 const SUPA_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 if (!SUPA_URL || !SUPA_KEY) { console.error('Missing Supabase credentials'); process.exit(1); }
 
-// ─── Helpers ─────────────────────────────────────────────────────────
+// ─── Logging & Utils ─────────────────────────────────────────────────
+const stats = { processed: 0, matched: 0, updated: 0, not_found: 0, skipped: 0, errors: 0 };
 function log(msg) { console.log(`[${new Date().toLocaleTimeString()}] ${msg}`); }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-const stats = {
-    queried: 0,
-    matched: 0,
-    updated: 0,
-    not_found: 0,
-    already_complete: 0,
-    errors: 0,
-    ss_requests: 0,
-};
 
 // ─── Cursor ──────────────────────────────────────────────────────────
 function loadCursor() {
@@ -77,15 +63,11 @@ function loadCursor() {
 }
 
 function saveCursor(cursor) {
-    if (DRY_RUN) return;
-    mkdirSync(CURSOR_DIR, { recursive: true });
-    writeFileSync(CURSOR_FILE, JSON.stringify({
-        ...cursor,
-        updated_at: new Date().toISOString(),
-    }, null, 2));
+    mkdirSync(dirname(CURSOR_FILE), { recursive: true });
+    writeFileSync(CURSOR_FILE, JSON.stringify({ ...cursor, saved_at: new Date().toISOString() }, null, 2));
 }
 
-// ─── ShipStation rate-limited GET ────────────────────────────────────
+// ─── ShipStation V1 Rate Limiter ─────────────────────────────────────
 let rateLimitRemaining = 40;
 
 async function ssGet(path) {
@@ -95,9 +77,8 @@ async function ssGet(path) {
         rateLimitRemaining = 40;
     }
 
-    stats.ss_requests++;
     const res = await fetch(`https://ssapi.shipstation.com${path}`, {
-        headers: { Authorization: SS_AUTH },
+        headers: { Authorization: SS_AUTH }
     });
 
     const remaining = res.headers.get('x-rate-limit-remaining');
@@ -110,258 +91,245 @@ async function ssGet(path) {
         rateLimitRemaining = 40;
         return ssGet(path);
     }
-    if (!res.ok) throw new Error(`ShipStation ${res.status}: ${await res.text()}`);
+    if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`ShipStation ${res.status}: ${body.slice(0, 200)}`);
+    }
     return res.json();
 }
 
-// ─── Supabase helpers ────────────────────────────────────────────────
-const supaHeaders = {
-    apikey: SUPA_KEY,
-    Authorization: `Bearer ${SUPA_KEY}`,
-    'Content-Type': 'application/json',
-};
-
+// ─── Supabase Helpers ────────────────────────────────────────────────
 async function supaGet(path) {
-    const res = await fetch(`${SUPA_URL}/rest/v1/${path}`, { headers: supaHeaders });
-    if (!res.ok) throw new Error(`Supabase GET ${res.status}: ${await res.text()}`);
-    return res.json();
+    const res = await fetch(`${SUPA_URL}/rest/v1/${path}`, {
+        headers: {
+            apikey: SUPA_KEY,
+            Authorization: `Bearer ${SUPA_KEY}`,
+            Prefer: 'count=exact'
+        }
+    });
+    const count = res.headers.get('content-range')?.split('/')?.pop();
+    const body = await res.json();
+    return { data: body, count: count ? parseInt(count) : null };
 }
 
 async function supaPatch(table, id, data) {
     if (DRY_RUN) return;
     const res = await fetch(`${SUPA_URL}/rest/v1/${table}?id=eq.${id}`, {
         method: 'PATCH',
-        headers: { ...supaHeaders, Prefer: 'return=minimal' },
-        body: JSON.stringify(data),
+        headers: {
+            apikey: SUPA_KEY,
+            Authorization: `Bearer ${SUPA_KEY}`,
+            'Content-Type': 'application/json',
+            Prefer: 'return=minimal'
+        },
+        body: JSON.stringify(data)
     });
-    if (!res.ok) throw new Error(`Supabase PATCH ${res.status}: ${await res.text()}`);
-}
-
-// ─── Carrier mapping ────────────────────────────────────────────────
-const CARRIER_NAMES = {
-    stamps_com: 'USPS (Stamps.com)', usps: 'USPS', ups: 'UPS', ups_walleted: 'UPS',
-    fedex: 'FedEx', amazon_buy_shipping: 'Amazon Buy Shipping',
-    dhl_express: 'DHL Express', ontrac: 'OnTrac',
-};
-
-// ─── Step 1: Query shipments missing data ────────────────────────────
-async function fetchIncompleteShipments(cursor) {
-    // Shipments that are not voided AND (missing label_cost OR missing tracking_number)
-    // Use created_at > cursor for pagination
-    const PAGE_SIZE = 500;
-    let all = [];
-    let offset = 0;
-    const cursorFilter = cursor?.last_shipment_id
-        ? `&id=gt.${cursor.last_shipment_id}`
-        : '';
-
-    while (true) {
-        const query = `shipments?is_voided=eq.false&or=(label_cost.is.null,tracking_number.is.null)&select=id,order_id,tracking_number,label_cost,carrier_name,carrier_service,shipped_at,data_source,external_ids&order=id.asc${cursorFilter}&offset=${offset}&limit=${PAGE_SIZE}`;
-        const rows = await supaGet(query);
-        all = all.concat(rows);
-        log(`  Fetched ${rows.length} incomplete shipments (total: ${all.length})`);
-        if (rows.length < PAGE_SIZE) break;
-        offset += PAGE_SIZE;
+    if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`PATCH ${table} ${res.status}: ${body.slice(0, 200)}`);
     }
-
-    stats.queried = all.length;
-    return all;
 }
 
-// ─── Step 2: Get order_number for a shipment ─────────────────────────
-const orderNumberCache = {};
+// ─── Fetch shipments needing enrichment ──────────────────────────────
+async function fetchIncompleteShipments(lastId) {
+    // Shipments missing label_cost OR tracking_number, not voided
+    let filter = 'shipments?is_voided=eq.false&or=(label_cost.is.null,tracking_number.is.null)';
+    filter += '&select=id,order_id,tracking_number,label_cost,carrier_name,carrier_service,shipped_at,data_source';
+    filter += `&order=id.asc&limit=${BATCH_SIZE}`;
+    if (lastId) filter += `&id=gt.${lastId}`;
+
+    const { data, count } = await supaGet(filter);
+    return { shipments: data || [], totalRemaining: count };
+}
+
+// ─── Fetch order number for a shipment ───────────────────────────────
+const orderCache = {};
 
 async function getOrderNumber(orderId) {
     if (!orderId) return null;
-    if (orderNumberCache[orderId]) return orderNumberCache[orderId];
-    const rows = await supaGet(`orders?id=eq.${orderId}&select=order_number&limit=1`);
-    const num = rows?.[0]?.order_number || null;
-    if (num) orderNumberCache[orderId] = num;
+    if (orderCache[orderId]) return orderCache[orderId];
+    const { data } = await supaGet(`orders?id=eq.${orderId}&select=order_number&limit=1`);
+    const num = data?.[0]?.order_number || null;
+    if (num) orderCache[orderId] = num;
     return num;
 }
 
-// ─── Step 3+4: Search ShipStation and enrich ─────────────────────────
-const ssCache = {};  // order_number → SS shipments array (avoid duplicate lookups)
-
-async function searchShipStation(orderNumber) {
-    if (ssCache[orderNumber] !== undefined) return ssCache[orderNumber];
-    const data = await ssGet(`/shipments?orderNumber=${encodeURIComponent(orderNumber)}&includeShipmentItems=true`);
-    const shipments = data.shipments || [];
-    ssCache[orderNumber] = shipments;
-    return shipments;
+// ─── Search ShipStation for matching shipment ────────────────────────
+async function findShipStationMatch(orderNumber) {
+    if (!orderNumber) return null;
+    const data = await ssGet(`/shipments?orderNumber=${encodeURIComponent(orderNumber)}&includeShipmentItems=true&pageSize=100`);
+    const shipments = data?.shipments || [];
+    // Return non-voided shipments only
+    return shipments.filter(s => !s.voided);
 }
 
-function pickBestMatch(ssShipments, shipment) {
-    if (!ssShipments.length) return null;
+// ─── Carrier mapping ─────────────────────────────────────────────────
+const CARRIER_NAMES = {
+    stamps_com: 'USPS (Stamps.com)', usps: 'USPS', ups: 'UPS', ups_walleted: 'UPS',
+    fedex: 'FedEx', amazon_buy_shipping: 'Amazon Buy Shipping',
+    dhl_express: 'DHL Express', ontrac: 'OnTrac'
+};
+
+// ─── Match ShipStation shipment to Supabase shipment ─────────────────
+function pickBestMatch(ssShipments, supaShipment) {
+    if (ssShipments.length === 0) return null;
     if (ssShipments.length === 1) return ssShipments[0];
 
-    // If shipment already has tracking, find exact match
-    if (shipment.tracking_number) {
-        const exact = ssShipments.find(s => s.trackingNumber === shipment.tracking_number);
-        if (exact) return exact;
+    // If we have a tracking number, match on it
+    if (supaShipment.tracking_number) {
+        const byTracking = ssShipments.find(s => s.trackingNumber === supaShipment.tracking_number);
+        if (byTracking) return byTracking;
     }
 
-    // Prefer non-voided shipments with cost
-    const valid = ssShipments.filter(s => !s.voided && s.shipmentCost != null);
-    if (valid.length === 1) return valid[0];
-    if (valid.length > 1) {
-        // Return the most recent
-        return valid.sort((a, b) => new Date(b.createDate) - new Date(a.createDate))[0];
-    }
+    // Otherwise pick the one with a cost (prefer non-zero cost)
+    const withCost = ssShipments.filter(s => s.shipmentCost > 0);
+    if (withCost.length === 1) return withCost[0];
 
+    // Fall back to first
     return ssShipments[0];
 }
 
-function buildPatch(shipment, ss) {
-    const patch = {};
-    let enriched = false;
+// ─── Build update payload ────────────────────────────────────────────
+function buildUpdate(supaShipment, ssMatch) {
+    const update = {};
+    let changed = false;
 
-    if (shipment.label_cost == null && ss.shipmentCost != null) {
-        patch.label_cost = ss.shipmentCost;
-        patch.insurance_cost = ss.insuranceCost || 0;
-        patch.total_cost = +(ss.shipmentCost + (ss.insuranceCost || 0)).toFixed(2);
-        enriched = true;
+    if (supaShipment.label_cost == null && ssMatch.shipmentCost != null) {
+        update.label_cost = ssMatch.shipmentCost;
+        update.total_cost = +(ssMatch.shipmentCost + (ssMatch.insuranceCost || 0)).toFixed(2);
+        if (ssMatch.insuranceCost) update.insurance_cost = ssMatch.insuranceCost;
+        changed = true;
     }
 
-    if (!shipment.tracking_number && ss.trackingNumber) {
-        patch.tracking_number = ss.trackingNumber;
-        patch.status = 'in_transit';
-        enriched = true;
+    if (!supaShipment.tracking_number && ssMatch.trackingNumber) {
+        update.tracking_number = ssMatch.trackingNumber;
+        changed = true;
     }
 
-    if (!shipment.carrier_name && ss.carrierCode) {
-        patch.carrier_name = CARRIER_NAMES[ss.carrierCode] || ss.carrierCode;
-        patch.carrier_code = ss.carrierCode;
-        enriched = true;
+    if (!supaShipment.carrier_name && ssMatch.carrierCode) {
+        update.carrier_name = CARRIER_NAMES[ssMatch.carrierCode] || ssMatch.carrierCode;
+        changed = true;
     }
 
-    if (!shipment.carrier_service && ss.serviceName) {
-        patch.carrier_service = ss.serviceName;
-        enriched = true;
+    if (!supaShipment.carrier_service && ssMatch.serviceName) {
+        update.carrier_service = ssMatch.serviceName;
+        changed = true;
     }
 
-    if (!shipment.shipped_at && ss.shipDate) {
-        patch.shipped_at = ss.shipDate + 'T00:00:00Z';
-        enriched = true;
+    if (!supaShipment.shipped_at && ssMatch.shipDate) {
+        update.shipped_at = ssMatch.shipDate.includes('T') ? ssMatch.shipDate : ssMatch.shipDate + 'T00:00:00Z';
+        changed = true;
     }
 
-    if (enriched) {
-        patch.data_source = 'shipstation';
-        // Merge external_ids
-        patch.external_ids = {
-            ...(shipment.external_ids || {}),
-            shipstation: String(ss.shipmentId),
-        };
+    if (changed) {
+        update.data_source = 'shipstation';
+        update.enriched_at = new Date().toISOString();
     }
 
-    return enriched ? patch : null;
+    return changed ? update : null;
 }
 
-// ─── Main processing loop ────────────────────────────────────────────
+// ─── Main ────────────────────────────────────────────────────────────
 async function main() {
-    log('╔══════════════════════════════════════════════════╗');
-    log('║  Cross-validate Shipments: Supabase ↔ ShipStation ║');
-    log('╚══════════════════════════════════════════════════╝');
-    if (DRY_RUN) log('*** DRY RUN — no changes will be written ***');
+    log('Cross-Validate Shipments: Veeqo ↔ ShipStation');
+    if (DRY_RUN) log('*** DRY RUN — no writes ***');
 
     const cursor = loadCursor();
-    if (cursor) {
-        log(`Resuming from cursor: shipment id > ${cursor.last_shipment_id} (${cursor.processed} already processed)`);
-    }
+    let lastId = cursor?.last_id || null;
+    if (lastId) log(`Resuming from cursor: id > ${lastId}`);
 
-    // Step 1: Get incomplete shipments
-    log('Step 1: Querying shipments missing label_cost or tracking_number...');
-    const shipments = await fetchIncompleteShipments(cursor);
-    const toProcess = BATCH_LIMIT ? shipments.slice(0, BATCH_LIMIT) : shipments;
-    log(`  Found ${shipments.length} incomplete shipments${BATCH_LIMIT ? `, processing ${toProcess.length}` : ''}`);
+    // Get initial count
+    const { totalRemaining } = await fetchIncompleteShipments(null);
+    log(`Total incomplete shipments (missing cost or tracking): ${totalRemaining}`);
 
-    if (toProcess.length === 0) {
-        log('✅ Nothing to process — all shipments are complete or cursor past end.');
-        return;
-    }
+    let batchNum = 0;
+    let keepGoing = true;
 
-    let processed = cursor?.processed || 0;
+    while (keepGoing) {
+        batchNum++;
+        const { shipments } = await fetchIncompleteShipments(lastId);
 
-    for (let i = 0; i < toProcess.length; i++) {
-        const shipment = toProcess[i];
+        if (shipments.length === 0) {
+            log('No more shipments to process.');
+            break;
+        }
 
-        try {
-            // Step 2: Get order_number
+        log(`\n── Batch ${batchNum}: ${shipments.length} shipments (starting after id ${lastId || 'start'}) ──`);
+
+        for (const shipment of shipments) {
+            stats.processed++;
+            lastId = shipment.id;
+
+            // 1. Get order number
             const orderNumber = await getOrderNumber(shipment.order_id);
             if (!orderNumber) {
+                stats.skipped++;
+                continue;
+            }
+
+            // 2. Search ShipStation
+            let ssShipments;
+            try {
+                ssShipments = await findShipStationMatch(orderNumber);
+            } catch (e) {
+                log(`  ⚠ SS lookup failed for ${orderNumber}: ${e.message}`);
                 stats.errors++;
                 continue;
             }
 
-            // Step 3: Search ShipStation
-            const ssShipments = await searchShipStation(orderNumber);
-            if (!ssShipments.length) {
-                stats.not_found++;
-                if (i % 200 === 0) {
-                    log(`  [${i + 1}/${toProcess.length}] ${orderNumber} — not found in ShipStation`);
-                }
-                continue;
-            }
-
-            // Find best match
-            const match = pickBestMatch(ssShipments, shipment);
-            if (!match) {
+            if (!ssShipments || ssShipments.length === 0) {
                 stats.not_found++;
                 continue;
             }
 
             stats.matched++;
 
-            // Step 4: Build and apply patch
-            const patch = buildPatch(shipment, match);
-            if (!patch) {
-                stats.already_complete++;
+            // 3. Pick best match and build update
+            const best = pickBestMatch(ssShipments, shipment);
+            const update = buildUpdate(shipment, best);
+
+            if (!update) {
+                // Matched but nothing new to add
                 continue;
             }
 
-            await supaPatch('shipments', shipment.id, patch);
-            stats.updated++;
+            // 4. Apply update
+            try {
+                await supaPatch('shipments', shipment.id, update);
+                stats.updated++;
 
-            if (i % 50 === 0 || i === toProcess.length - 1) {
-                log(`  [${i + 1}/${toProcess.length}] ${orderNumber} → enriched (cost=$${match.shipmentCost ?? '?'}, tracking=${match.trackingNumber ? '✓' : '✗'}) [rate-limit: ${rateLimitRemaining}]`);
+                if (stats.updated % 50 === 0 || stats.processed <= 5) {
+                    const fields = Object.keys(update).filter(k => k !== 'data_source' && k !== 'enriched_at').join(', ');
+                    log(`  ✓ ${orderNumber} → enriched: ${fields}${DRY_RUN ? ' (dry)' : ''}`);
+                }
+            } catch (e) {
+                log(`  ⚠ Update failed for ${shipment.id}: ${e.message}`);
+                stats.errors++;
             }
-        } catch (e) {
-            log(`  ⚠ Shipment ${shipment.id}: ${e.message}`);
-            stats.errors++;
+
+            // Save cursor every 100 processed
+            if (stats.processed % 100 === 0) {
+                saveCursor({ last_id: lastId, stats: { ...stats } });
+            }
         }
 
-        processed++;
-
-        // Save cursor every 100 records
-        if (processed % 100 === 0) {
-            saveCursor({
-                last_shipment_id: shipment.id,
-                processed,
-            });
-        }
+        // Progress log
+        log(`  Progress: ${stats.processed} processed | ${stats.matched} matched | ${stats.updated} updated | ${stats.not_found} not found | ${stats.errors} errors | rate_limit=${rateLimitRemaining}`);
     }
 
     // Final cursor save
-    if (toProcess.length > 0) {
-        saveCursor({
-            last_shipment_id: toProcess[toProcess.length - 1].id,
-            processed,
-        });
-    }
+    saveCursor({ last_id: lastId, completed: true, stats: { ...stats } });
 
-    // ─── Report ──────────────────────────────────────────────────────
-    log('');
-    log('════════════════════════════════════════════════');
-    log('  Cross-validation complete');
-    log('════════════════════════════════════════════════');
-    log(`  Shipments queried:     ${stats.queried}`);
-    log(`  Matched in ShipStation: ${stats.matched}`);
-    log(`  Updated/enriched:      ${stats.updated}`);
-    log(`  Already complete:      ${stats.already_complete}`);
-    log(`  Not found in SS:       ${stats.not_found}`);
-    log(`  Errors:                ${stats.errors}`);
-    log(`  ShipStation API calls: ${stats.ss_requests}`);
-    log('════════════════════════════════════════════════');
+    // ─── Summary ─────────────────────────────────────────────────────
+    log('\n════════════════════════════════════');
+    log('Cross-validation complete!');
+    log(`  Processed:    ${stats.processed}`);
+    log(`  Matched:      ${stats.matched} (found in ShipStation)`);
+    log(`  Updated:      ${stats.updated} (enriched with new data)`);
+    log(`  Not found:    ${stats.not_found} (no ShipStation match)`);
+    log(`  Skipped:      ${stats.skipped} (no order number)`);
+    log(`  Errors:       ${stats.errors}`);
+    log('════════════════════════════════════');
 
     if (stats.errors > 0) process.exit(1);
 }

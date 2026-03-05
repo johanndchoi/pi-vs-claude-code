@@ -1,107 +1,86 @@
-# Amazon Advertising Spend Import
+# Amazon Advertising API Setup
 
-## Overview
+## Current Status
 
-`amazon-ads.mjs` imports advertising spend data into `channel_fees` with `fee_type='advertising'`.
+**The Amazon Advertising API requires separate registration** from the SP-API.
+Until this is set up, the `amazon-ads.mjs` script will:
+1. Attempt the Advertising API (and gracefully fail)
+2. Scan settlement reports for any ad-related fees (none found — Amazon bills ad spend to credit card, not settlements)
+3. Report what's needed
 
-It uses two strategies:
+## What's Needed
 
-1. **Amazon Advertising API** (preferred) — campaign-level spend with impressions/clicks
-2. **Settlement report mining** (fallback) — scans settlement TSVs for ad-related fee rows
+### 1. Register for Amazon Advertising API Access
 
-## Strategy 1: Amazon Advertising API Setup
+Go to: https://advertising.amazon.com/API/docs/en-us/setting-up/overview
 
-The Advertising API is **separate from SP-API** and requires its own registration:
+Steps:
+1. **Log into Amazon Advertising Console**: https://advertising.amazon.com
+   - Use the same seller account that runs Sponsored Products campaigns
+2. **Register your application** (or update existing SP-API app):
+   - Go to https://advertising.amazon.com/developer/
+   - Register a new API client (or request access for your existing LWA app)
+   - The LWA client ID from SP-API may work if you add Advertising API scope
+3. **Get an Advertising API profile ID**:
+   - Once authorized, call `GET /v2/profiles` to list your advertising profiles
+   - The US marketplace seller profile ID is what you need
 
-### Prerequisites
+### 2. Store Credentials in 1Password
 
-1. **Amazon Advertising Account** — must be linked to your Seller Central account
-2. **Developer Registration** — register at [advertising.amazon.com/developer](https://advertising.amazon.com/developer)
-3. **API Access Approval** — request access; Amazon reviews applications (can take days)
-4. **Client ID** — same LWA `client_id` used for SP-API works here
-5. **Advertising Profile** — each marketplace has a profile; the script auto-discovers via `GET /v2/profiles`
+Add to `Agents Service Accounts` vault, item `Amazon SP-API Credentials`:
+- `AdvertisingProfileId` — from step 1.3 above
 
-### What's Needed (if not yet set up)
+Or create a new item `Amazon Advertising API Credentials` with:
+- `ProfileId` — your advertising profile ID
+- (The LWA credentials are shared with SP-API)
 
-| Step | Action | Status |
-|------|--------|--------|
-| 1 | Register at [advertising.amazon.com/developer](https://advertising.amazon.com/developer) | ❓ Check |
-| 2 | Link your SP-API app to Advertising API access | ❓ Check |
-| 3 | Ensure LWA app has `advertising::campaign_management` scope | ❓ Check |
-| 4 | Verify refresh token has advertising permissions | ❓ Check |
-
-### Auth Flow
-
-The Advertising API uses the same LWA OAuth tokens as SP-API:
-- Same `client_id` / `client_secret`
-- Same `refresh_token` (if the app has advertising scope)
-- Extra header: `Amazon-Advertising-API-ClientId: <client_id>`
-- Profile-scoped: `Amazon-Advertising-API-Scope: <profile_id>`
-
-### Endpoints Used
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/v2/profiles` | List advertising profiles for the account |
-| POST | `/reporting/reports` | Request a Sponsored Products campaign report |
-| GET | `/reporting/reports/{id}` | Check report status and get download URL |
-
-## Strategy 2: Settlement Report Mining
-
-Settlement reports (`GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2`) may contain advertising fees. The script scans for rows where:
-
-- `amount-type` contains "Advertising" or "Sponsored"
-- `amount-description` contains "Advertising", "Sponsored", "CPC"
-- `transaction-type` is "other-transaction" with ad-related descriptions
-
-### Important Limitation
-
-Most Sponsored Products charges are billed directly to your credit card and do **not** appear in settlement reports. Settlement mining catches:
-
-- Advertising credits/adjustments
-- Ad fees deducted from seller balance
-- Promotional advertising charges
-
-For full campaign-level spend data, the Advertising API (Strategy 1) is required.
-
-## Usage
+### 3. Verify Access
 
 ```bash
-# Normal run (tries Ads API, then mines settlements)
-node amazon-ads.mjs
-
-# Skip Ads API, only mine settlements
-node amazon-ads.mjs --settlement-only
-
-# Custom lookback period
-node amazon-ads.mjs --days 30
+cd supabase/sync
+node amazon-ads.mjs --dry-run
 ```
 
-## Data Model
+## How Ad Spend Data Flows in Amazon
 
-Stored in `channel_fees`:
+| Data Source | Contains Ad Spend? | Notes |
+|---|---|---|
+| Settlement Reports (V2) | ❌ No | Only contains order fees, commissions, refunds |
+| Advertising API | ✅ Yes | Sponsored Products/Brands/Display campaign data |
+| Credit Card Statement | ✅ Yes | Amazon charges ad spend to seller's card |
+| Business Reports (SP-API) | ❌ No | Sales metrics only |
 
-```json
-{
-  "channel_id": "7f84462f-...",
-  "order_id": null,            // null for campaign-level, set if order-linked
-  "fee_type": "advertising",
-  "description": "Sponsored Products: Campaign Name",
-  "amount": 12.50,
-  "currency_code": "USD",
-  "incurred_at": "2025-01-15",
-  "external_ref": "ads-{profileId}-{campaignId}-{date}",
-  "metadata": {
-    "source": "ads_api",       // or "settlement"
-    "campaign_id": "...",
-    "campaign_name": "...",
-    "impressions": 1234,
-    "clicks": 56,
-    "profile_id": "..."
-  }
-}
-```
+## Settlement Report Fee Types (for reference)
 
-## Cron
+From our data, settlement reports contain these `amount-type | amount-description` combos:
+- `Order | ItemFees | Commission`
+- `Order | ItemPrice | Principal`
+- `Order | ItemPrice | Tax`
+- `Order | ItemWithheldTax | MarketplaceFacilitatorTax-Principal`
+- `Order | Promotion | Principal`
+- `Refund | ItemFees | Commission`
+- `Refund | ItemFees | RefundCommission`
+- `Refund | ItemPrice | Principal / Tax`
+- `Refund | ItemWithheldTax | MarketplaceFacilitatorTax-Principal`
 
-Added to `cron.mjs` as `amazon-ads`, runs daily (1440 min interval), in the `amazon` API group.
+**None** of these are advertising-related.
+
+## Data Schema
+
+When working, ad spend is stored in `channel_fees`:
+
+| Column | Value |
+|---|---|
+| `channel_id` | `7f84462f-86c8-4e09-abb6-285631db0d83` (Amazon) |
+| `fee_type` | `advertising` |
+| `description` | `SP: {campaign name}` |
+| `amount` | Daily spend in USD |
+| `external_ref` | `ads-sp-{campaignId}-{YYYYMMDD}` (for dedup) |
+| `metadata` | `{ campaign_id, impressions, clicks, cost, profile_id }` |
+
+## Manual Workaround
+
+Until the API is set up, you can manually export ad data:
+1. Go to Amazon Advertising Console → Campaigns → Sponsored Products
+2. Download campaign performance report (daily granularity)
+3. The CSV can be imported with a small script if needed

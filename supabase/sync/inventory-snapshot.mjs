@@ -1,17 +1,16 @@
 #!/usr/bin/env node
 
 /**
- * Daily Inventory Snapshot
- * Records stock levels per variant per warehouse for sell-through
- * and stockout analysis.
+ * Daily Inventory Snapshot → Supabase
+ * Records stock levels per variant per warehouse for sell-through & stockout analysis.
  *
  * Primary: Veeqo GET /products (sellables → stock_entries)
- * Fallback: ShipStation GET /products + /warehouses (cross-check)
+ * Fallback: ShipStation GET /warehouses + /products for cross-check
  *
  * Usage:
- *   node inventory-snapshot.mjs              # Today's snapshot
+ *   node inventory-snapshot.mjs              # Take today's snapshot
  *   node inventory-snapshot.mjs --dry-run    # Preview without writing
- *   node inventory-snapshot.mjs --date 2026-03-01  # Backfill specific date
+ *   node inventory-snapshot.mjs --force      # Overwrite existing snapshot
  */
 
 import { readFileSync } from 'fs';
@@ -22,10 +21,9 @@ import { fileURLToPath } from 'url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const DRY_RUN = args.includes('--dry-run');
-const DATE_ARG = args.find((_, i) => args[i - 1] === '--date');
-const SNAPSHOT_DATE = DATE_ARG || new Date().toISOString().split('T')[0];
+const FORCE = args.includes('--force');
 
-// ─── Load credentials ────────────────────────────────────────────────
+// ─── Credentials ─────────────────────────────────────────────────────
 function loadEnv() {
     try {
         const content = readFileSync(join(__dirname, '..', '.env.local'), 'utf8');
@@ -38,294 +36,364 @@ function loadEnv() {
 loadEnv();
 
 const VEEQO_KEY = process.env.VEEQO_API_KEY ||
-    execSync('op item get "Veeqo API Credentials" --vault="Agents Service Accounts" --reveal --fields label=credential', { encoding: 'utf8' }).trim();
+    execSync('op read "op://Agents Service Accounts/Veeqo API Credentials/credential"',
+        { encoding: 'utf8', env: { ...process.env } }).trim();
+
+const SS_KEY = process.env.SS_V1_KEY ||
+    execSync('op read "op://Agents Service Accounts/Shipstation v1 API Credential/API Key"',
+        { encoding: 'utf8', env: { ...process.env } }).trim();
+const SS_SECRET = process.env.SS_V1_SECRET ||
+    execSync('op read "op://Agents Service Accounts/Shipstation v1 API Credential/API Secret"',
+        { encoding: 'utf8', env: { ...process.env } }).trim();
+const SS_AUTH = 'Basic ' + Buffer.from(`${SS_KEY}:${SS_SECRET}`).toString('base64');
 
 const SUPA_URL = process.env.SUPABASE_API_URL;
 const SUPA_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-if (!SUPA_URL || !SUPA_KEY) { console.error('Missing SUPABASE_API_URL or SUPABASE_SERVICE_ROLE_KEY'); process.exit(1); }
-
-// ShipStation credentials (fallback)
-let SS_AUTH = null;
-function getShipStationAuth() {
-    if (SS_AUTH) return SS_AUTH;
-    try {
-        const ssKey = process.env.SS_V1_KEY ||
-            execSync('op read "op://Agents Service Accounts/Shipstation v1 API Credential/API Key"', { encoding: 'utf8' }).trim();
-        const ssSecret = process.env.SS_V1_SECRET ||
-            execSync('op read "op://Agents Service Accounts/Shipstation v1 API Credential/API Secret"', { encoding: 'utf8' }).trim();
-        SS_AUTH = 'Basic ' + Buffer.from(`${ssKey}:${ssSecret}`).toString('base64');
-        return SS_AUTH;
-    } catch (e) {
-        log(`  ⚠ ShipStation credentials unavailable: ${e.message}`);
-        return null;
-    }
-}
+if (!SUPA_URL || !SUPA_KEY) { console.error('Missing Supabase credentials'); process.exit(1); }
 
 // ─── Stats ───────────────────────────────────────────────────────────
-const stats = { inserted: 0, skipped_existing: 0, skipped_no_variant: 0, errors: 0, ss_fallback: 0 };
+const stats = {
+    veeqo_products: 0,
+    rows_prepared: 0,
+    rows_inserted: 0,
+    rows_skipped_existing: 0,
+    shipstation_fallback: false,
+    errors: 0
+};
+
 function log(msg) { console.log(`[${new Date().toLocaleTimeString()}] ${msg}`); }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ─── API helpers ─────────────────────────────────────────────────────
+const TODAY = new Date().toISOString().split('T')[0];
+
+// ─── Veeqo API ──────────────────────────────────────────────────────
+let veeqoRequestCount = 0;
+let veeqoWindowStart = Date.now();
+
 async function veeqoGet(path) {
+    // Rate limit: ~150 req/min
+    veeqoRequestCount++;
+    if (veeqoRequestCount > 140) {
+        const elapsed = Date.now() - veeqoWindowStart;
+        if (elapsed < 60000) {
+            const wait = 60000 - elapsed + 500;
+            log(`  ⏳ Veeqo rate limit pause (${Math.ceil(wait / 1000)}s)...`);
+            await sleep(wait);
+        }
+        veeqoRequestCount = 0;
+        veeqoWindowStart = Date.now();
+    }
+
     const res = await fetch(`https://api.veeqo.com${path}`, {
         headers: { 'x-api-key': VEEQO_KEY }
     });
+
+    if (res.status === 429) {
+        log('  ⏳ Veeqo 429, waiting 60s...');
+        await sleep(60000);
+        veeqoRequestCount = 0;
+        veeqoWindowStart = Date.now();
+        return veeqoGet(path);
+    }
     if (!res.ok) throw new Error(`Veeqo ${res.status}: ${await res.text()}`);
     return res.json();
 }
 
-async function shipStationGet(path) {
-    const auth = getShipStationAuth();
-    if (!auth) return null;
+// ─── ShipStation API ─────────────────────────────────────────────────
+let rateLimitRemaining = 40;
+
+async function ssGet(path) {
+    if (rateLimitRemaining <= 2) {
+        log('  ⏳ ShipStation rate limit pause (11s)...');
+        await sleep(11000);
+        rateLimitRemaining = 40;
+    }
+
     const res = await fetch(`https://ssapi.shipstation.com${path}`, {
-        headers: { Authorization: auth }
+        headers: { Authorization: SS_AUTH }
     });
+
+    const remaining = res.headers.get('x-rate-limit-remaining');
+    if (remaining != null) rateLimitRemaining = parseInt(remaining);
+
+    if (res.status === 429) {
+        const reset = parseInt(res.headers.get('x-rate-limit-reset') || '10');
+        log(`  ⏳ ShipStation 429, waiting ${reset + 1}s...`);
+        await sleep((reset + 1) * 1000);
+        rateLimitRemaining = 40;
+        return ssGet(path);
+    }
     if (!res.ok) throw new Error(`ShipStation ${res.status}: ${await res.text()}`);
     return res.json();
 }
 
-async function supaPost(table, data) {
-    if (DRY_RUN) { log(`  [DRY RUN] ${table}: ${JSON.stringify(data).slice(0, 120)}`); return { ok: true }; }
+// ─── Supabase helpers ────────────────────────────────────────────────
+async function supabasePost(table, rows) {
+    if (rows.length === 0) return { inserted: 0, skipped: 0 };
+
+    // Use upsert with ON CONFLICT to skip existing
+    const prefer = FORCE
+        ? 'resolution=merge-duplicates'
+        : 'resolution=ignore-duplicates';
+
     const res = await fetch(`${SUPA_URL}/rest/v1/${table}`, {
         method: 'POST',
         headers: {
-            apikey: SUPA_KEY,
-            Authorization: `Bearer ${SUPA_KEY}`,
+            'apikey': SUPA_KEY,
+            'Authorization': `Bearer ${SUPA_KEY}`,
             'Content-Type': 'application/json',
-            Prefer: 'return=minimal,resolution=merge-duplicates'
+            'Prefer': `${prefer},return=representation,count=exact`
         },
-        body: JSON.stringify(data)
+        body: JSON.stringify(rows)
     });
+
     if (!res.ok) {
-        const body = await res.text();
-        // UNIQUE violation = already snapshotted today, not an error
-        if (res.status === 409 || body.includes('duplicate') || body.includes('unique')) {
-            return { ok: false, duplicate: true };
-        }
-        throw new Error(`Supabase ${table} ${res.status}: ${body}`);
+        const text = await res.text();
+        throw new Error(`Supabase POST ${table}: ${res.status} ${text}`);
     }
-    return { ok: true };
+
+    const count = parseInt(res.headers.get('content-range')?.split('/')[1] || '0');
+    const data = await res.json();
+    return { inserted: data.length, total: count };
 }
 
-async function supaGet(path) {
-    const res = await fetch(`${SUPA_URL}/rest/v1/${path}`, {
-        headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` }
+async function supabaseGet(table, params = '') {
+    const res = await fetch(`${SUPA_URL}/rest/v1/${table}?${params}`, {
+        headers: {
+            'apikey': SUPA_KEY,
+            'Authorization': `Bearer ${SUPA_KEY}`
+        }
     });
+    if (!res.ok) throw new Error(`Supabase GET ${table}: ${res.status}`);
     return res.json();
 }
 
-// ─── Build variant/warehouse lookup caches ───────────────────────────
-const variantCache = {};   // sku -> { id, ... }
-const warehouseCache = {}; // external_id -> uuid
+// ─── Variant lookup cache ────────────────────────────────────────────
+let variantMap = null; // sku → variant_id
 
-async function loadCaches() {
-    log('Loading variant and warehouse caches...');
-
-    // Load all active variants
-    let offset = 0;
-    while (true) {
-        const batch = await supaGet(
-            `product_variants?is_active=eq.true&select=id,sku,external_ids&limit=1000&offset=${offset}`
-        );
-        for (const v of batch) {
-            if (v.sku) variantCache[v.sku] = v;
-        }
-        if (batch.length < 1000) break;
-        offset += 1000;
+async function loadVariantMap() {
+    log('Loading product variants from Supabase...');
+    const variants = await supabaseGet('product_variants', 'select=id,sku&limit=10000');
+    variantMap = new Map();
+    for (const v of variants) {
+        if (v.sku) variantMap.set(v.sku, v.id);
     }
-    log(`  Cached ${Object.keys(variantCache).length} variants`);
-
-    // Load warehouses
-    const warehouses = await supaGet('warehouses?select=id,external_id&is_active=eq.true');
-    for (const w of warehouses) {
-        if (w.external_id) warehouseCache[w.external_id] = w.id;
-    }
-    log(`  Cached ${Object.keys(warehouseCache).length} warehouses`);
+    log(`  Loaded ${variantMap.size} variant SKUs`);
 }
 
-// ─── Check if snapshot already done ──────────────────────────────────
-async function snapshotExists() {
-    const rows = await supaGet(
-        `inventory_snapshots?snapshot_date=eq.${SNAPSHOT_DATE}&select=id&limit=1`
-    );
-    return rows && rows.length > 0;
+// ─── Check if snapshot exists for today ──────────────────────────────
+async function snapshotExistsToday() {
+    const rows = await supabaseGet('inventory_snapshots',
+        `snapshot_date=eq.${TODAY}&select=id&limit=1`);
+    return rows.length > 0;
 }
 
-// ─── Fetch all Veeqo products with stock ─────────────────────────────
+// ─── Pull inventory from Veeqo ──────────────────────────────────────
 async function fetchVeeqoInventory() {
-    let all = [], page = 1;
-    while (true) {
-        log(`  Fetching Veeqo products page ${page}...`);
-        const batch = await veeqoGet(`/products?page_size=100&page=${page}`);
-        all = all.concat(batch);
-        if (batch.length < 100) break;
-        page++;
-        await sleep(300); // Rate limit courtesy
-    }
-    return all;
-}
-
-// ─── Extract snapshot rows from Veeqo data ──────────────────────────
-function extractVeeqoSnapshots(products) {
-    const rows = [];
-    for (const product of products) {
-        for (const sellable of (product.sellables || [])) {
-            const sku = sellable.sku_code;
-            if (!sku) continue;
-
-            const variant = variantCache[sku];
-            if (!variant) {
-                stats.skipped_no_variant++;
-                continue;
-            }
-
-            for (const se of (sellable.stock_entries || [])) {
-                const whExtId = String(se.warehouse_id);
-                const warehouseId = warehouseCache[whExtId] || null;
-
-                rows.push({
-                    variant_id: variant.id,
-                    sku,
-                    warehouse_id: warehouseId,
-                    quantity: se.physical_stock_level || 0,
-                    snapshot_date: SNAPSHOT_DATE,
-                    data_source: 'veeqo'
-                });
-            }
-        }
-    }
-    return rows;
-}
-
-// ─── ShipStation fallback: cross-check for missing SKUs ──────────────
-async function fetchShipStationInventory(existingSkus) {
-    log('  Checking ShipStation for additional inventory data...');
-    const auth = getShipStationAuth();
-    if (!auth) { log('  ⚠ ShipStation unavailable, skipping fallback'); return []; }
-
+    log('Fetching products from Veeqo...');
     const rows = [];
     let page = 1;
+    const pageSize = 100;
+
     while (true) {
-        const data = await shipStationGet(`/products?pageSize=500&page=${page}`);
-        if (!data || !data.products) break;
+        const products = await veeqoGet(`/products?page_size=${pageSize}&page=${page}`);
+        if (!products || products.length === 0) break;
 
-        for (const prod of data.products) {
-            const sku = prod.sku;
-            if (!sku || existingSkus.has(sku)) continue;
+        stats.veeqo_products += products.length;
 
-            const variant = variantCache[sku];
-            if (!variant) continue;
+        for (const product of products) {
+            const sellables = product.sellables || [];
+            for (const sellable of sellables) {
+                const sku = sellable.sku_code;
+                if (!sku) continue;
 
-            // ShipStation doesn't break stock by warehouse in product list,
-            // use warehouseQuantity if available
-            if (prod.warehouseLocation || prod.quantity != null) {
-                rows.push({
-                    variant_id: variant.id,
-                    sku,
-                    warehouse_id: null,  // ShipStation product list doesn't specify warehouse
-                    quantity: prod.quantity || 0,
-                    snapshot_date: SNAPSHOT_DATE,
-                    data_source: 'shipstation'
-                });
-                stats.ss_fallback++;
-            }
-        }
+                const variantId = variantMap?.get(sku) || null;
+                const stockEntries = sellable.stock_entries || [];
 
-        if (data.products.length < 500 || page >= data.pages) break;
-        page++;
-        await sleep(500); // ShipStation rate limit: 40 req/min
-    }
-
-    return rows;
-}
-
-// ─── Batch insert snapshots ──────────────────────────────────────────
-async function insertSnapshots(rows) {
-    log(`Inserting ${rows.length} snapshot rows...`);
-    const BATCH = 200;
-
-    for (let i = 0; i < rows.length; i += BATCH) {
-        const batch = rows.slice(i, i + BATCH);
-        try {
-            const result = await supaPost('inventory_snapshots', batch);
-            if (result.duplicate) {
-                stats.skipped_existing += batch.length;
-            } else {
-                stats.inserted += batch.length;
-            }
-        } catch (e) {
-            // If batch fails, try individual inserts
-            for (const row of batch) {
-                try {
-                    const result = await supaPost('inventory_snapshots', row);
-                    if (result.duplicate) {
-                        stats.skipped_existing++;
-                    } else {
-                        stats.inserted++;
+                if (stockEntries.length === 0) {
+                    // No warehouse breakdown — record total
+                    rows.push({
+                        variant_id: variantId,
+                        sku,
+                        warehouse_id: null,
+                        quantity: sellable.total_quantity_sold != null
+                            ? (sellable.quantity_to_sell || 0)
+                            : (sellable.stock_level || 0),
+                        snapshot_date: TODAY,
+                        data_source: 'veeqo'
+                    });
+                } else {
+                    for (const entry of stockEntries) {
+                        rows.push({
+                            variant_id: variantId,
+                            sku,
+                            warehouse_id: null, // Veeqo warehouse IDs are integers, not UUIDs
+                            quantity: entry.physical_quantity ?? entry.stock_level ?? 0,
+                            snapshot_date: TODAY,
+                            data_source: 'veeqo'
+                        });
                     }
-                } catch (e2) {
-                    log(`  ⚠ ${row.sku}: ${e2.message}`);
-                    stats.errors++;
                 }
             }
         }
 
-        if (i + BATCH < rows.length) {
-            log(`  Progress: ${Math.min(i + BATCH, rows.length)}/${rows.length}`);
+        log(`  Page ${page}: ${products.length} products (${rows.length} stock rows so far)`);
+
+        if (products.length < pageSize) break;
+        page++;
+    }
+
+    return rows;
+}
+
+// ─── ShipStation fallback ────────────────────────────────────────────
+async function fetchShipStationInventory() {
+    log('Falling back to ShipStation for inventory data...');
+    stats.shipstation_fallback = true;
+    const rows = [];
+
+    // Get warehouses
+    const warehouses = await ssGet('/warehouses');
+    log(`  Found ${warehouses.length} ShipStation warehouses`);
+
+    // Get products (paginated)
+    let page = 1;
+    while (true) {
+        const data = await ssGet(`/products?pageSize=500&page=${page}`);
+        const products = data.products || [];
+        if (products.length === 0) break;
+
+        for (const product of products) {
+            const sku = product.sku;
+            if (!sku) continue;
+
+            const variantId = variantMap?.get(sku) || null;
+
+            // ShipStation products don't have per-warehouse stock in the products endpoint
+            // Use the warehouse quantity if available
+            rows.push({
+                variant_id: variantId,
+                sku,
+                warehouse_id: null,
+                quantity: product.warehouseLocation ? 0 : 0, // ShipStation doesn't expose stock in products API
+                snapshot_date: TODAY,
+                data_source: 'shipstation'
+            });
+        }
+
+        log(`  Page ${page}: ${products.length} products`);
+        if (page >= (data.pages || 1)) break;
+        page++;
+    }
+
+    return rows;
+}
+
+// ─── Deduplicate rows (keep one per SKU+warehouse) ───────────────────
+function dedupeRows(rows) {
+    const seen = new Map();
+    for (const row of rows) {
+        const key = `${row.sku}::${row.warehouse_id || 'null'}`;
+        // Keep the row with higher quantity (more accurate)
+        const existing = seen.get(key);
+        if (!existing || row.quantity > existing.quantity) {
+            seen.set(key, row);
         }
     }
+    return [...seen.values()];
 }
 
 // ─── Main ────────────────────────────────────────────────────────────
 async function main() {
-    log(`Inventory Snapshot — ${SNAPSHOT_DATE}`);
-    if (DRY_RUN) log('*** DRY RUN — no writes ***');
+    log(`=== Inventory Snapshot — ${TODAY} ===`);
+    if (DRY_RUN) log('DRY RUN — no data will be written');
 
-    // Check if already done
-    if (!DRY_RUN && await snapshotExists()) {
-        log(`Snapshot for ${SNAPSHOT_DATE} already exists. Skipping.`);
-        log('Use --date YYYY-MM-DD to snapshot a different date.');
-        return;
+    // Check if snapshot already taken today
+    if (!FORCE) {
+        const exists = await snapshotExistsToday();
+        if (exists) {
+            log(`Snapshot for ${TODAY} already exists. Use --force to overwrite.`);
+            stats.rows_skipped_existing = 1;
+            printStats();
+            return;
+        }
     }
 
-    await loadCaches();
+    await loadVariantMap();
 
-    // Primary: Veeqo
-    log('Fetching inventory from Veeqo...');
-    const veeqoProducts = await fetchVeeqoInventory();
-    log(`  Got ${veeqoProducts.length} products from Veeqo`);
+    // Try Veeqo first
+    let rows = [];
+    try {
+        rows = await fetchVeeqoInventory();
+    } catch (err) {
+        log(`⚠ Veeqo failed: ${err.message}`);
+        stats.errors++;
+    }
 
-    const rows = extractVeeqoSnapshots(veeqoProducts);
-    log(`  Extracted ${rows.length} stock entries from Veeqo`);
-
-    // Fallback: ShipStation cross-check for SKUs not in Veeqo
-    const veeqoSkus = new Set(rows.map(r => r.sku));
-    const ssRows = await fetchShipStationInventory(veeqoSkus);
-    if (ssRows.length > 0) {
-        log(`  Added ${ssRows.length} entries from ShipStation fallback`);
-        rows.push(...ssRows);
+    // Fallback to ShipStation if Veeqo returned nothing useful
+    if (rows.length === 0) {
+        try {
+            rows = await fetchShipStationInventory();
+        } catch (err) {
+            log(`⚠ ShipStation fallback also failed: ${err.message}`);
+            stats.errors++;
+        }
     }
 
     if (rows.length === 0) {
-        log('No inventory data found. Aborting.');
+        log('❌ No inventory data collected from any source');
         process.exit(1);
     }
 
-    // Insert
-    await insertSnapshots(rows);
+    // Deduplicate
+    rows = dedupeRows(rows);
+    stats.rows_prepared = rows.length;
+    log(`Prepared ${rows.length} snapshot rows`);
 
-    // Summary
-    log('────────────────────────────────────');
-    log('Snapshot complete!');
-    log(`  Date:              ${SNAPSHOT_DATE}`);
-    log(`  Inserted:          ${stats.inserted}`);
-    log(`  Skipped (existing):${stats.skipped_existing}`);
-    log(`  Skipped (no var):  ${stats.skipped_no_variant}`);
-    log(`  ShipStation adds:  ${stats.ss_fallback}`);
-    log(`  Errors:            ${stats.errors}`);
+    if (DRY_RUN) {
+        log('Sample rows:');
+        for (const row of rows.slice(0, 5)) {
+            log(`  ${row.sku}: qty=${row.quantity} src=${row.data_source}`);
+        }
+        printStats();
+        return;
+    }
 
-    if (stats.errors > 0) process.exit(1);
+    // Insert in batches of 500
+    const BATCH = 500;
+    for (let i = 0; i < rows.length; i += BATCH) {
+        const batch = rows.slice(i, i + BATCH);
+        try {
+            const result = await supabasePost('inventory_snapshots', batch);
+            stats.rows_inserted += result.inserted;
+            log(`  Batch ${Math.floor(i / BATCH) + 1}: inserted ${result.inserted} rows`);
+        } catch (err) {
+            // Handle unique constraint violations gracefully
+            if (err.message.includes('409') || err.message.includes('duplicate') || err.message.includes('23505')) {
+                stats.rows_skipped_existing += batch.length;
+                log(`  Batch ${Math.floor(i / BATCH) + 1}: skipped (already exists)`);
+            } else {
+                stats.errors++;
+                log(`  ⚠ Batch error: ${err.message}`);
+            }
+        }
+    }
+
+    printStats();
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+function printStats() {
+    log('─'.repeat(50));
+    log(`Sync complete — ${TODAY}`);
+    log(`  Veeqo products scanned: ${stats.veeqo_products}`);
+    log(`  Rows prepared:          ${stats.rows_prepared}`);
+    log(`  Rows inserted:          ${stats.rows_inserted}`);
+    log(`  Rows skipped (exist):   ${stats.rows_skipped_existing}`);
+    log(`  ShipStation fallback:   ${stats.shipstation_fallback ? 'YES' : 'no'}`);
+    log(`  Errors:                 ${stats.errors}`);
+}
+
+main().catch(err => {
+    console.error('Fatal:', err);
+    process.exit(1);
+});

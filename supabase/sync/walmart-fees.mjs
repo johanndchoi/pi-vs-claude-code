@@ -1,26 +1,37 @@
 #!/usr/bin/env node
 
 /**
- * Walmart Recon Reports → Supabase channel_fees
- * Downloads reconciliation reports and imports commission fees per order.
+ * Walmart Channel Fees Sync → Supabase
+ *
+ * Imports commission fees from Walmart reconciliation reports into the
+ * channel_fees table. For orders not yet in any recon report (too recent
+ * or cancelled), estimates fees at the known 15% commission rate.
  *
  * Usage:
- *   node walmart-fees.mjs              # Process unimported reports
- *   node walmart-fees.mjs --all        # Re-process all available
+ *   node walmart-fees.mjs                        # Sync all available reports
+ *   node walmart-fees.mjs --report 02242026      # Sync specific report date
+ *   node walmart-fees.mjs --fill-gaps             # Estimate fees for orders with no recon data
+ *   node walmart-fees.mjs --dry-run               # Preview changes
  */
 
-import { readFileSync, mkdirSync, writeFileSync } from 'fs';
+import { readFileSync } from 'fs';
 import { execSync } from 'child_process';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { createWriteStream, unlinkSync } from 'fs';
+import { createWriteStream, mkdirSync, existsSync, unlinkSync } from 'fs';
 import { createUnzip } from 'zlib';
-import { pipeline } from 'stream/promises';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
-const ALL = args.includes('--all');
+const DRY_RUN = args.includes('--dry-run');
+const FILL_GAPS = args.includes('--fill-gaps');
+const reportArg = args.find((_, i) => args[i - 1] === '--report');
 
+// ─── Config ──────────────────────────────────────────────────────────
+const WM_CHANNEL_ID = '2da7e1e0-579e-4968-bdef-fa18492a6a86';
+const DEFAULT_COMMISSION_RATE = 15.0; // All Walmart items are 15%
+
+// ─── Env / Credentials ──────────────────────────────────────────────
 function loadEnv() {
     try {
         const content = readFileSync(join(__dirname, '..', '.env.local'), 'utf8');
@@ -34,20 +45,33 @@ loadEnv();
 
 const SUPA_URL = process.env.SUPABASE_API_URL;
 const SUPA_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const WM_CLIENT_ID = execSync('op read "op://Agents Service Accounts/Walmart API Credentials/username"', { encoding: 'utf8' }).trim();
-const WM_CLIENT_SECRET = execSync('op read "op://Agents Service Accounts/Walmart API Credentials/credential"', { encoding: 'utf8' }).trim();
+if (!SUPA_URL || !SUPA_KEY) { console.error('Missing Supabase credentials'); process.exit(1); }
 
-const WALMART_CHANNEL_ID = '2da7e1e0-579e-4968-bdef-fa18492a6a86';
-const CURSOR_FILE = join(__dirname, '..', '.locks', 'walmart-fees.cursor');
+const WM_CLIENT_ID = execSync('op read "op://Agents Service Accounts/Walmart API Credentials/username"',
+    { encoding: 'utf8', env: { ...process.env } }).trim();
+const WM_CLIENT_SECRET = execSync('op read "op://Agents Service Accounts/Walmart API Credentials/credential"',
+    { encoding: 'utf8', env: { ...process.env } }).trim();
 
-const stats = { reports: 0, fees_created: 0, skipped: 0, matched: 0, unmatched: 0, errors: 0, estimated_replaced: 0 };
+// ─── Stats ───────────────────────────────────────────────────────────
+const stats = {
+    reports_processed: 0,
+    rows_parsed: 0,
+    fees_inserted: 0,
+    fees_skipped_existing: 0,
+    fees_estimated: 0,
+    orders_not_found: 0,
+    errors: 0
+};
+
 function log(msg) { console.log(`[${new Date().toLocaleTimeString()}] ${msg}`); }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ─── Walmart auth ────────────────────────────────────────────────────
-let wmToken = null, wmExpiry = 0;
-async function getToken() {
-    if (wmToken && Date.now() < wmExpiry) return wmToken;
+// ─── Walmart Auth ────────────────────────────────────────────────────
+let wmToken = null;
+let wmTokenExpiry = 0;
+
+async function wmAuth() {
+    if (wmToken && Date.now() < wmTokenExpiry) return wmToken;
     const res = await fetch('https://marketplace.walmartapis.com/v3/token', {
         method: 'POST',
         headers: {
@@ -59,262 +83,391 @@ async function getToken() {
         },
         body: 'grant_type=client_credentials'
     });
+    if (!res.ok) throw new Error(`Walmart auth failed: ${res.status}`);
     const data = await res.json();
     wmToken = data.access_token;
-    wmExpiry = Date.now() + (data.expires_in - 60) * 1000;
+    wmTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
     return wmToken;
 }
 
-function wmHeaders() {
-    return {
-        'WM_SVC.NAME': 'Walmart Marketplace',
-        'WM_QOS.CORRELATION_ID': `fees-${Date.now()}`,
-        Authorization: 'Basic ' + Buffer.from(`${WM_CLIENT_ID}:${WM_CLIENT_SECRET}`).toString('base64'),
-        'WM_SEC.ACCESS_TOKEN': wmToken,
-        Accept: 'application/octet-stream'
-    };
+// ─── Walmart Recon API ───────────────────────────────────────────────
+async function getAvailableReports() {
+    const token = await wmAuth();
+    const res = await fetch('https://marketplace.walmartapis.com/v3/report/reconreport/availableReconFiles', {
+        headers: {
+            'WM_SEC.ACCESS_TOKEN': token,
+            'WM_SVC.NAME': 'Walmart Marketplace',
+            'WM_QOS.CORRELATION_ID': `fees-${Date.now()}`,
+            Accept: 'application/json'
+        }
+    });
+    if (!res.ok) throw new Error(`Failed to get report list: ${res.status}`);
+    const data = await res.json();
+    return data.availableApReportDates || [];
 }
 
-// ─── CSV parser ──────────────────────────────────────────────────────
+async function downloadReport(reportDate) {
+    const token = await wmAuth();
+    const res = await fetch(
+        `https://marketplace.walmartapis.com/v3/report/reconreport/reconFile?reportDate=${reportDate}`, {
+        headers: {
+            'WM_SEC.ACCESS_TOKEN': token,
+            'WM_SVC.NAME': 'Walmart Marketplace',
+            'WM_QOS.CORRELATION_ID': `fees-${Date.now()}`,
+            Accept: 'application/octet-stream'
+        }
+    });
+    if (!res.ok) throw new Error(`Failed to download report ${reportDate}: ${res.status}`);
+    return Buffer.from(await res.arrayBuffer());
+}
+
+function parseReconCSV(csvText, reportDate) {
+    const lines = csvText.split('\n').filter(l => l.trim());
+    if (lines.length < 2) return [];
+
+    const headers = parseCSVLine(lines[0]);
+    const rows = [];
+
+    for (let i = 1; i < lines.length; i++) {
+        const values = parseCSVLine(lines[i]);
+        if (values.length < 23) continue;
+
+        const row = {};
+        headers.forEach((h, idx) => { row[h] = values[idx] || ''; });
+
+        const orderNum = row['Walmart.com Order #']?.trim();
+        const poNum = row['Walmart.com PO #']?.trim();
+        const txType = row['Transaction Type']?.trim();
+        const sku = row['Partner Item ID']?.trim();
+        const commission = parseFloat(row['Commission from Sale']) || 0;
+        const commissionRate = row['Commission Rate']?.trim() || '';
+        const txDate = row['Transaction Date Time']?.trim();
+
+        if (!orderNum) continue;
+
+        // Build a unique transaction key from PO + line
+        const poLine = row['Walmart.com P.O. Line #']?.trim() || '1';
+        const txKey = `${poNum}_${poLine}`;
+
+        rows.push({
+            order_number: orderNum,
+            po_number: poNum,
+            transaction_type: txType,
+            transaction_date: txDate,
+            sku,
+            commission: Math.abs(commission),
+            commission_rate: commissionRate,
+            transaction_key: txKey,
+            report_date: reportDate,
+            gross_sales: parseFloat(row['Gross Sales Revenue']) || 0,
+            description: `Commission on Product`
+        });
+    }
+
+    return rows;
+}
+
 function parseCSVLine(line) {
     const result = [];
-    let current = '', inQuotes = false;
-    for (const ch of line) {
-        if (ch === '"') { inQuotes = !inQuotes; continue; }
-        if (ch === ',' && !inQuotes) { result.push(current.trim()); current = ''; continue; }
-        current += ch;
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+        const c = line[i];
+        if (c === '"') {
+            inQuotes = !inQuotes;
+        } else if (c === ',' && !inQuotes) {
+            result.push(current);
+            current = '';
+        } else {
+            current += c;
+        }
     }
-    result.push(current.trim());
+    result.push(current);
     return result;
 }
 
-function parseCSV(content) {
-    const lines = content.split('\n').filter(l => l.trim());
-    if (lines.length < 2) return [];
-    const headers = parseCSVLine(lines[0]);
-    return lines.slice(1).map(line => {
-        const vals = parseCSVLine(line);
-        const row = {};
-        headers.forEach((h, i) => row[h] = vals[i] || '');
-        return row;
+// ─── Supabase Helpers ────────────────────────────────────────────────
+async function supaGet(path) {
+    const res = await fetch(`${SUPA_URL}/rest/v1/${path}`, {
+        headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` }
     });
+    if (!res.ok) throw new Error(`GET ${path}: ${res.status}`);
+    return res.json();
 }
 
-// ─── Supabase helpers ────────────────────────────────────────────────
-const supaH = { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` };
-const orderCache = {};
-const estimatedCleaned = new Set();
-
-async function findOrderId(orderNum) {
-    if (orderCache[orderNum] !== undefined) return orderCache[orderNum];
-    const res = await fetch(`${SUPA_URL}/rest/v1/orders?order_number=eq.${encodeURIComponent(orderNum)}&select=id`, { headers: supaH });
-    const rows = await res.json();
-    orderCache[orderNum] = rows?.[0]?.id || null;
-    return orderCache[orderNum];
-}
-
-async function upsertFee(data) {
-    const res = await fetch(`${SUPA_URL}/rest/v1/channel_fees`, {
+async function supaPost(table, data) {
+    if (DRY_RUN) return;
+    const res = await fetch(`${SUPA_URL}/rest/v1/${table}`, {
         method: 'POST',
-        headers: { ...supaH, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' },
+        headers: {
+            apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`,
+            'Content-Type': 'application/json',
+            Prefer: 'return=representation,resolution=ignore-duplicates'
+        },
         body: JSON.stringify(data)
     });
-    if (res.ok) return true;
-    const body = await res.text();
-    if (body.includes('23505') || body.includes('duplicate')) { stats.skipped++; return true; }
-    stats.errors++;
-    return false;
+    if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`POST ${table} ${res.status}: ${body.slice(0, 300)}`);
+    }
+    return res.json();
 }
 
-async function removeEstimatedFees(orderId) {
-    // Remove placeholder fees (wm-estimated-*) when actual recon data arrives
-    const res = await fetch(
-        `${SUPA_URL}/rest/v1/channel_fees?order_id=eq.${orderId}&external_ref=like.wm-estimated-*`,
-        { method: 'DELETE', headers: { ...supaH, Prefer: 'return=representation' } }
+// ─── Build order lookup ──────────────────────────────────────────────
+async function buildOrderLookup() {
+    // Fetch all Walmart orders
+    const orders = await supaGet(
+        `orders?channel_id=eq.${WM_CHANNEL_ID}&select=id,order_number,status,subtotal,ordered_at,external_ids&limit=1000`
     );
-    if (res.ok) {
-        const removed = await res.json();
-        if (removed.length) {
-            log(`    ✓ Removed ${removed.length} estimated fee(s) for order ${orderId}`);
-            stats.estimated_replaced += removed.length;
+    const lookup = {};
+    for (const o of orders) {
+        lookup[o.order_number] = o;
+    }
+    log(`Loaded ${orders.length} Walmart orders from DB`);
+    return lookup;
+}
+
+async function getExistingFeeRefs() {
+    // Get all existing external_refs for Walmart fees to avoid duplicates
+    let all = [];
+    let offset = 0;
+    const pageSize = 1000;
+    while (true) {
+        const batch = await supaGet(
+            `channel_fees?channel_id=eq.${WM_CHANNEL_ID}&select=external_ref&limit=${pageSize}&offset=${offset}`
+        );
+        all.push(...batch);
+        if (batch.length < pageSize) break;
+        offset += pageSize;
+    }
+    return new Set(all.map(r => r.external_ref));
+}
+
+// ─── Process a single recon report ───────────────────────────────────
+async function processReport(reportDate, orderLookup, existingRefs) {
+    log(`Processing report: ${reportDate}`);
+
+    const zipBuffer = await downloadReport(reportDate);
+
+    // Extract ZIP - use child process since Node zlib doesn't handle ZIP format
+    const tmpZip = `/tmp/wm-recon-${reportDate}.zip`;
+    const tmpDir = `/tmp/wm-recon-${reportDate}`;
+    require('fs').writeFileSync(tmpZip, zipBuffer);
+    execSync(`mkdir -p ${tmpDir} && cd ${tmpDir} && unzip -o ${tmpZip} 2>/dev/null`, { encoding: 'utf8' });
+
+    // Find CSV
+    const csvFiles = execSync(`ls ${tmpDir}/*.csv 2>/dev/null`, { encoding: 'utf8' }).trim().split('\n');
+    if (!csvFiles[0]) {
+        log(`  ⚠ No CSV found in report ${reportDate}`);
+        return;
+    }
+
+    const csvText = readFileSync(csvFiles[0], 'utf8');
+    const rows = parseReconCSV(csvText, reportDate);
+    log(`  Parsed ${rows.length} transaction rows`);
+    stats.rows_parsed += rows.length;
+
+    // Group by order_number to handle multi-line orders
+    const byOrder = {};
+    for (const row of rows) {
+        if (!byOrder[row.order_number]) byOrder[row.order_number] = [];
+        byOrder[row.order_number].push(row);
+    }
+
+    let inserted = 0;
+    let skipped = 0;
+    let notFound = 0;
+
+    for (const [orderNum, txRows] of Object.entries(byOrder)) {
+        const order = orderLookup[orderNum];
+        if (!order) {
+            notFound++;
+            continue;
+        }
+
+        for (const tx of txRows) {
+            // Build external_ref for dedup
+            const extRef = `wm-${tx.transaction_key}-${tx.description.replace(/\s+/g, '')}`;
+
+            if (existingRefs.has(extRef)) {
+                skipped++;
+                continue;
+            }
+
+            if (tx.commission === 0 && tx.transaction_type === 'SALE') continue;
+
+            const fee = {
+                order_id: order.id,
+                channel_id: WM_CHANNEL_ID,
+                fee_type: 'marketplace_commission',
+                description: tx.description,
+                amount: tx.commission,
+                currency_code: 'USD',
+                incurred_at: parseTxDate(tx.transaction_date),
+                external_ref: extRef,
+                metadata: {
+                    sku: tx.sku,
+                    report_date: reportDate,
+                    commission_rate: tx.commission_rate,
+                    transaction_key: tx.transaction_key,
+                    transaction_type: tx.transaction_type
+                }
+            };
+
+            try {
+                await supaPost('channel_fees', fee);
+                existingRefs.add(extRef);
+                inserted++;
+            } catch (e) {
+                log(`  ⚠ Insert failed for ${orderNum}: ${e.message}`);
+                stats.errors++;
+            }
         }
     }
+
+    log(`  Inserted: ${inserted}, Skipped (existing): ${skipped}, Orders not in DB: ${notFound}`);
+    stats.fees_inserted += inserted;
+    stats.fees_skipped_existing += skipped;
+    stats.orders_not_found += notFound;
+    stats.reports_processed++;
+
+    // Cleanup
+    try {
+        execSync(`rm -rf ${tmpZip} ${tmpDir}`);
+    } catch {}
 }
 
-// ─── Fee type mapping ────────────────────────────────────────────────
-function mapFeeType(amountType) {
-    if (amountType.includes('Total Walmart Funded Savings')) return 'walmart_funded_incentive';
-    if (amountType.includes('Commission')) return 'marketplace_commission';
-    if (amountType.includes('Shipping')) return 'shipping_fee';
-    if (amountType.includes('Return')) return 'return_fee';
-    if (amountType.includes('Adjustment')) return 'adjustment';
-    if (amountType.includes('WFS')) return 'fulfillment_fee';
-    return 'other';
+function parseTxDate(dateStr) {
+    if (!dateStr) return new Date().toISOString();
+    // Format: MM/DD/YYYY
+    const m = dateStr.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+    if (m) return `${m[3]}-${m[1]}-${m[2]}T00:00:00Z`;
+    return new Date().toISOString();
 }
 
-// ─── Cursor ──────────────────────────────────────────────────────────
-function loadCursor() { try { return JSON.parse(readFileSync(CURSOR_FILE, 'utf8')); } catch { return { processed: [] }; } }
-function saveCursor(data) { mkdirSync(dirname(CURSOR_FILE), { recursive: true }); writeFileSync(CURSOR_FILE, JSON.stringify(data)); }
+// ─── Fill gaps: estimate fees for orders not in any recon report ─────
+async function fillGaps(orderLookup, existingRefs) {
+    log('Filling gaps: estimating fees for orders without recon data');
 
-// ─── Main ────────────────────────────────────────────────────────────
-async function main() {
-    log('Walmart fees import starting');
-    await getToken();
+    // Get all order_ids that already have channel_fees
+    let allFeeOrderIds = new Set();
+    let offset = 0;
+    while (true) {
+        const batch = await supaGet(
+            `channel_fees?channel_id=eq.${WM_CHANNEL_ID}&select=order_id&limit=1000&offset=${offset}`
+        );
+        for (const r of batch) allFeeOrderIds.add(r.order_id);
+        if (batch.length < 1000) break;
+        offset += 1000;
+    }
 
-    // Get available report dates
-    const listRes = await fetch(
-        'https://marketplace.walmartapis.com/v3/report/reconreport/availableReconFiles?reportVersion=v1',
-        { headers: { ...wmHeaders(), Accept: 'application/json' } }
-    );
-    const listData = await listRes.json();
-    const dates = listData.availableApReportDates || [];
-    log(`  ${dates.length} recon reports available`);
+    const ordersWithoutFees = Object.values(orderLookup).filter(o => !allFeeOrderIds.has(o.id));
+    log(`  Found ${ordersWithoutFees.length} orders without channel_fees`);
 
-    const cursor = loadCursor();
-    const processed = new Set(cursor.processed || []);
-    const toProcess = ALL ? dates : dates.filter(d => !processed.has(d));
-    log(`  ${toProcess.length} to process`);
+    for (const order of ordersWithoutFees) {
+        const isCancelled = ['cancelled', 'refunded'].includes(order.status);
+        const extRef = `wm-estimated-${order.order_number}`;
 
-    for (const reportDate of toProcess) {
+        if (existingRefs.has(extRef)) {
+            stats.fees_skipped_existing++;
+            continue;
+        }
+
+        let commission = 0;
+        let description = 'Commission on Product (estimated)';
+
+        if (isCancelled) {
+            commission = 0;
+            description = 'No commission - order ' + order.status;
+        } else {
+            // Estimate at 15% of subtotal
+            commission = +(order.subtotal * DEFAULT_COMMISSION_RATE / 100).toFixed(2);
+        }
+
+        const fee = {
+            order_id: order.id,
+            channel_id: WM_CHANNEL_ID,
+            fee_type: 'marketplace_commission',
+            description,
+            amount: commission,
+            currency_code: 'USD',
+            incurred_at: order.ordered_at,
+            external_ref: extRef,
+            metadata: {
+                estimated: true,
+                commission_rate: isCancelled ? '0.00' : DEFAULT_COMMISSION_RATE.toFixed(2),
+                order_status: order.status,
+                subtotal: order.subtotal,
+                reason: isCancelled
+                    ? `Order ${order.status} — no commission charged`
+                    : 'Not yet in recon report — estimated at 15% of subtotal'
+            }
+        };
+
         try {
-            await getToken();
-            const res = await fetch(
-                `https://marketplace.walmartapis.com/v3/report/reconreport/reconFile?reportDate=${reportDate}&reportVersion=v1`,
-                { headers: wmHeaders() }
-            );
-
-            if (!res.ok) {
-                log(`  ⚠ Report ${reportDate}: ${res.status}`);
-                stats.errors++;
-                continue;
+            if (DRY_RUN) {
+                log(`  [DRY] ${order.order_number}: $${commission} (${description})`);
+            } else {
+                await supaPost('channel_fees', fee);
+                log(`  ✓ ${order.order_number}: $${commission} (${description})`);
             }
-
-            // Download ZIP and extract
-            const zipPath = `/tmp/wm_recon_${reportDate}.zip`;
-            const buffer = Buffer.from(await res.arrayBuffer());
-            writeFileSync(zipPath, buffer);
-
-            // Extract with unzip command
-            const extractDir = `/tmp/wm_recon_${reportDate}`;
-            execSync(`mkdir -p ${extractDir} && unzip -o ${zipPath} -d ${extractDir} 2>/dev/null`, { encoding: 'utf8' });
-            const csvFiles = execSync(`ls ${extractDir}/*.csv 2>/dev/null`, { encoding: 'utf8' }).trim().split('\n').filter(f => f);
-
-            if (!csvFiles.length) {
-                log(`  ⚠ Report ${reportDate}: no CSV in ZIP`);
-                continue;
-            }
-
-            const csvContent = readFileSync(csvFiles[0], 'utf8');
-            const rows = parseCSV(csvContent);
-            log(`  Report ${reportDate}: ${rows.length} rows`);
-
-            // Extract payout info from PaymentSummary rows
-            for (const row of rows) {
-                if (row['Transaction Type'] === 'PaymentSummary' && row['Total Payable']) {
-                    const payoutAmount = parseFloat(row['Total Payable']) || 0;
-                    if (payoutAmount <= 0) continue;
-                    function parseMDY(d) {
-                        if (!d) return null;
-                        const [m, dd, y] = d.split('/');
-                        return `${y}-${m.padStart(2,'0')}-${dd.padStart(2,'0')}`;
-                    }
-                    const payoutData = {
-                        channel_id: WALMART_CHANNEL_ID,
-                        payout_date: parseMDY(row['Transaction Posted Timestamp']),
-                        period_start: parseMDY(row['Period Start Date']),
-                        period_end: parseMDY(row['Period End Date']),
-                        gross_amount: payoutAmount,
-                        fees_amount: 0,
-                        refunds_amount: 0,
-                        net_amount: payoutAmount,
-                        currency_code: 'USD',
-                        external_ref: `wm-payout-${reportDate}`,
-                        status: 'deposited',
-                        deposited_at: parseMDY(row['Transaction Posted Timestamp']),
-                        raw_data: { report_date: reportDate, description: row['Transaction Description'] }
-                    };
-                    const payRes = await fetch(`${SUPA_URL}/rest/v1/payouts`, {
-                        method: 'POST',
-                        headers: { ...supaH, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' },
-                        body: JSON.stringify(payoutData)
-                    });
-                    if (payRes.ok) log(`    → Payout: $${payoutAmount.toFixed(2)} on ${payoutData.payout_date}`);
-                }
-            }
-
-            let created = 0;
-            for (const row of rows) {
-                const orderNum = row['Customer Order #'];
-                const amountType = row['Amount Type'] || '';
-                const amount = parseFloat(row['Amount']) || 0;
-
-                // Only import fee rows (commission, incentives, not product price/tax)
-                if (!orderNum || !amountType.includes('Commission') && !amountType.includes('Return') && !amountType.includes('Adjustment') && !amountType.includes('Walmart Funded')) continue;
-
-                const orderId = await findOrderId(orderNum);
-                if (!orderId) { stats.unmatched++; continue; }
-                stats.matched++;
-
-                // Remove any estimated placeholder fees now that we have real recon data
-                if (!estimatedCleaned.has(orderId)) {
-                    await removeEstimatedFees(orderId);
-                    estimatedCleaned.add(orderId);
-                }
-
-                const txKey = row['Transaction Key'] || `${reportDate}-${orderNum}-${row['Customer Order line #']}`;
-                const externalRef = `wm-${txKey}-${amountType.replace(/\s+/g, '')}`;
-
-                await upsertFee({
-                    order_id: orderId,
-                    channel_id: WALMART_CHANNEL_ID,
-                    fee_type: mapFeeType(amountType),
-                    description: amountType,
-                    amount: Math.abs(amount),
-                    currency_code: row['Currency'] || 'USD',
-                    incurred_at: row['Transaction Posted Timestamp'] || null,
-                    external_ref: externalRef,
-                    metadata: {
-                        report_date: reportDate,
-                        sku: row['Partner Item Id'] || null,
-                        commission_rate: row['Commission Rate'] || null,
-                        transaction_type: row['Transaction Type'] || null,
-                        transaction_key: txKey,
-                        ...(row['Commission Saving'] ? { commission_saving: row['Commission Saving'] } : {}),
-                        ...(row['Commission Incentive Program'] ? { commission_incentive_program: row['Commission Incentive Program'] } : {}),
-                        ...(row['Customer Promo Type'] ? { customer_promo_type: row['Customer Promo Type'] } : {}),
-                        ...(row['Total Walmart Funded Savings Program'] ? { walmart_funded_savings: row['Total Walmart Funded Savings Program'] } : {}),
-                        ...(row['Incentive Program Name'] ? { incentive_program: row['Incentive Program Name'] } : {}),
-                        ...(row['Original charge'] ? { original_charge: row['Original charge'] } : {}),
-                        ...(row['Charge Savings'] ? { charge_savings: row['Charge Savings'] } : {})
-                    }
-                });
-                created++;
-            }
-
-            stats.fees_created += created;
-            stats.reports++;
-            processed.add(reportDate);
-            log(`    → ${created} fees imported`);
-
-            // Cleanup
-            try { unlinkSync(zipPath); execSync(`rm -rf ${extractDir}`); } catch {}
-            await sleep(1000);
+            existingRefs.add(extRef);
+            stats.fees_estimated++;
         } catch (e) {
-            log(`  ⚠ Report ${reportDate}: ${e.message}`);
+            log(`  ⚠ ${order.order_number}: ${e.message}`);
             stats.errors++;
         }
     }
+}
 
-    saveCursor({ processed: [...processed] });
+// ─── Main ────────────────────────────────────────────────────────────
+async function main() {
+    log('Walmart Channel Fees Sync');
+    if (DRY_RUN) log('*** DRY RUN ***');
+
+    const orderLookup = await buildOrderLookup();
+    const existingRefs = await getExistingFeeRefs();
+    log(`Loaded ${existingRefs.size} existing fee references`);
+
+    if (FILL_GAPS) {
+        await fillGaps(orderLookup, existingRefs);
+    } else {
+        // Get available report dates
+        const availableDates = await getAvailableReports();
+        const reportDates = reportArg ? [reportArg] : availableDates;
+
+        // Sort by date (MMDDYYYY → sortable)
+        const sorted = reportDates
+            .filter(d => d.match(/^\d{8}$/))
+            .sort((a, b) => {
+                const toSort = d => d.slice(4) + d.slice(0, 4); // YYYYMMDD
+                return toSort(a).localeCompare(toSort(b));
+            });
+
+        log(`Processing ${sorted.length} report(s)`);
+
+        for (const date of sorted) {
+            try {
+                await processReport(date, orderLookup, existingRefs);
+                await sleep(2000); // Rate limit between reports
+            } catch (e) {
+                log(`  ⚠ Report ${date}: ${e.message}`);
+                stats.errors++;
+            }
+        }
+    }
 
     log('────────────────────────────────────');
-    log(`Done! Reports: ${stats.reports}`);
-    log(`  Fees created:  ${stats.fees_created}`);
-    log(`  Skipped dupes: ${stats.skipped}`);
-    log(`  Orders matched: ${stats.matched}`);
-    log(`  Unmatched:     ${stats.unmatched}`);
-    log(`  Est. replaced: ${stats.estimated_replaced}`);
-    log(`  Errors:        ${stats.errors}`);
+    log('Summary:');
+    log(`  Reports processed:     ${stats.reports_processed}`);
+    log(`  Rows parsed:           ${stats.rows_parsed}`);
+    log(`  Fees inserted:         ${stats.fees_inserted}`);
+    log(`  Fees estimated:        ${stats.fees_estimated}`);
+    log(`  Skipped (existing):    ${stats.fees_skipped_existing}`);
+    log(`  Orders not in DB:      ${stats.orders_not_found}`);
+    log(`  Errors:                ${stats.errors}`);
+
+    if (stats.errors > 0) process.exit(1);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
