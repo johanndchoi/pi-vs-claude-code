@@ -34,7 +34,7 @@ function loadEnv() {
 loadEnv();
 
 const VEEQO_KEY = process.env.VEEQO_API_KEY ||
-    execSync('op item get "Veeqo API Credentials" --vault="Agents Service Accounts" --reveal --fields label=credential', { encoding: 'utf8' }).trim();
+    execSync('op read "op://Agents Service Accounts/Veeqo API Credentials/credential"', { encoding: 'utf8' }).trim();
 const SUPA_URL = process.env.SUPABASE_API_URL;
 const SUPA_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 if (!SUPA_URL || !SUPA_KEY) { console.error('Missing Supabase credentials'); process.exit(1); }
