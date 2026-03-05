@@ -98,6 +98,12 @@ const JOBS = {
         api_group: 'veeqo',
         interval_min: 1440,      // Once per day (runs at 6am via cron)
         description: 'Daily inventory snapshot for sell-through analysis'
+    },
+    'amazon-ads': {
+        script: 'amazon-ads.mjs',
+        api_group: 'amazon',
+        interval_min: 1440,      // Daily
+        description: 'Import Amazon advertising spend (Ads API + settlement mining)'
     }
 };
 
