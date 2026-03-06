@@ -44,7 +44,7 @@ const JOBS = {
     },
     'veeqo-tracking': {
         script: 'veeqo-tracking.mjs',
-        args: ['--recent', '500'],
+        args: ['--recent', '2000'],
         api_group: 'veeqo',
         interval_min: 120,       // Every 2 hours
         description: 'Update tracking events for recent shipments'
