@@ -167,11 +167,45 @@ function getOrderNumber(orderId) {
     return orderCache[orderId] || null;
 }
 
+// ─── Bulk-load ALL ShipStation shipments into index ──────────────────
+const ssIndex = {};  // orderNumber → [shipment, ...]
+let ssIndexLoaded = false;
+
+async function loadShipStationIndex() {
+    if (ssIndexLoaded) return;
+    log('Bulk-loading all ShipStation shipments (this may take a few minutes)...');
+    let page = 1;
+    let totalPages = 1;
+    let count = 0;
+
+    while (page <= totalPages) {
+        const data = await ssGet(`/shipments?pageSize=500&page=${page}`);
+        totalPages = data.pages || 1;
+        const shipments = data.shipments || [];
+        count += shipments.length;
+
+        for (const s of shipments) {
+            const key = s.orderNumber;
+            if (key) {
+                if (!ssIndex[key]) ssIndex[key] = [];
+                ssIndex[key].push(s);
+            }
+        }
+
+        if (page % 10 === 0 || page === totalPages) {
+            log(`  Loaded page ${page}/${totalPages} (${count} shipments, ${Object.keys(ssIndex).length} orders)`);
+        }
+        page++;
+    }
+
+    ssIndexLoaded = true;
+    log(`ShipStation index ready: ${count} shipments across ${Object.keys(ssIndex).length} orders`);
+}
+
 // ─── Search ShipStation for matching shipment ────────────────────────
-async function findShipStationMatch(orderNumber) {
+function findShipStationMatch(orderNumber) {
     if (!orderNumber) return null;
-    const data = await ssGet(`/shipments?orderNumber=${encodeURIComponent(orderNumber)}&includeShipmentItems=true&pageSize=100`);
-    const shipments = data?.shipments || [];
+    const shipments = ssIndex[orderNumber] || [];
     // Return non-voided shipments only
     return shipments.filter(s => !s.voided);
 }
@@ -252,6 +286,9 @@ async function main() {
     let lastId = cursor?.last_id || null;
     if (lastId) log(`Resuming from cursor: id > ${lastId}`);
 
+    // Bulk-load ShipStation index first
+    await loadShipStationIndex();
+
     // Get initial count
     const { totalRemaining } = await fetchIncompleteShipments(null);
     log(`Total incomplete shipments (missing cost or tracking): ${totalRemaining}`);
@@ -285,18 +322,8 @@ async function main() {
                 continue;
             }
 
-            // 2. Search ShipStation (cached per order number)
-            let ssShipments;
-            try {
-                if (!ssCache[orderNumber]) {
-                    ssCache[orderNumber] = await findShipStationMatch(orderNumber);
-                }
-                ssShipments = ssCache[orderNumber];
-            } catch (e) {
-                log(`  ⚠ SS lookup failed for ${orderNumber}: ${e.message}`);
-                stats.errors++;
-                continue;
-            }
+            // 2. Search ShipStation index (local, instant)
+            const ssShipments = findShipStationMatch(orderNumber);
 
             if (!ssShipments || ssShipments.length === 0) {
                 stats.not_found++;
