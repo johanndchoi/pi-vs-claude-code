@@ -1,0 +1,135 @@
+{
+  "name": "Sub: Amazon Token",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "t1",
+      "name": "Execute Sub-workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/sync_cursors?source=eq.amazon_token&limit=1",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "options": { "response": { "response": { "responseFormat": "json" } } }
+      },
+      "id": "t2",
+      "name": "Read Cached Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [440, 0],
+      "credentials": { "supabaseApi": { "id": "gHruXnC2qqFwxMPZ", "name": "Supabase account" } }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const rows = $input.all().map(i => i.json);\nconst flat = Array.isArray(rows[0]) ? rows[0] : rows;\nconst cached = flat[0] || {};\nconst meta = cached.metadata || {};\nconst token = meta.access_token || '';\nconst expiresAt = meta.expires_at || '';\nconst now = new Date().toISOString();\nconst isValid = token && expiresAt && expiresAt > now;\nreturn [{ json: { isValid: isValid ? 'true' : 'false', access_token: token } }];"
+      },
+      "id": "t3",
+      "name": "Check Expiry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "" },
+          "conditions": [
+            { "id": "c1", "leftValue": "={{ $json.isValid }}", "rightValue": "true", "operator": { "type": "string", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "t4",
+      "name": "Token Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [880, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const token = $input.first().json.access_token;\nreturn [{ json: { access_token: token } }];"
+      },
+      "id": "t5",
+      "name": "Return Cached",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, -100]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.amazon.com/auth/o2/token",
+        "authentication": "none",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "Content-Type", "value": "application/x-www-form-urlencoded" }] },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            { "name": "grant_type", "value": "refresh_token" },
+            { "name": "refresh_token", "value": "={{ $env.AMZ_REFRESH_TOKEN }}" },
+            { "name": "client_id", "value": "={{ $env.AMZ_CLIENT_ID }}" },
+            { "name": "client_secret", "value": "={{ $env.AMZ_CLIENT_SECRET }}" }
+          ]
+        },
+        "options": { "response": { "response": { "responseFormat": "json" } } }
+      },
+      "id": "t6",
+      "name": "Refresh Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [1100, 100]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/sync_cursors?on_conflict=source",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Content-Type", "value": "application/json" },
+          { "name": "Prefer", "value": "return=minimal,resolution=merge-duplicates" }
+        ]},
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ source: 'amazon_token', cursor_value: new Date().toISOString(), metadata: { access_token: $json.access_token, expires_at: new Date(Date.now() + ($json.expires_in - 60) * 1000).toISOString() } }) }}",
+        "options": {}
+      },
+      "id": "t7",
+      "name": "Cache Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [1320, 100],
+      "credentials": { "supabaseApi": { "id": "gHruXnC2qqFwxMPZ", "name": "Supabase account" } }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const token = $('Refresh Token').first().json.access_token;\nreturn [{ json: { access_token: token } }];"
+      },
+      "id": "t8",
+      "name": "Return Fresh",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1540, 100]
+    }
+  ],
+  "connections": {
+    "Execute Sub-workflow Trigger": { "main": [[{ "node": "Read Cached Token", "type": "main", "index": 0 }]] },
+    "Read Cached Token": { "main": [[{ "node": "Check Expiry", "type": "main", "index": 0 }]] },
+    "Check Expiry": { "main": [[{ "node": "Token Valid?", "type": "main", "index": 0 }]] },
+    "Token Valid?": { "main": [[{ "node": "Return Cached", "type": "main", "index": 0 }], [{ "node": "Refresh Token", "type": "main", "index": 0 }]] },
+    "Refresh Token": { "main": [[{ "node": "Cache Token", "type": "main", "index": 0 }]] },
+    "Cache Token": { "main": [[{ "node": "Return Fresh", "type": "main", "index": 0 }]] }
+  },
+  "settings": {}
+}
