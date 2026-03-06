@@ -14,7 +14,7 @@
  *   node walmart-fees.mjs --dry-run               # Preview changes
  */
 
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync } from 'fs';
 import { execSync } from 'child_process';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -252,7 +252,7 @@ async function processReport(reportDate, orderLookup, existingRefs) {
     // Extract ZIP - use child process since Node zlib doesn't handle ZIP format
     const tmpZip = `/tmp/wm-recon-${reportDate}.zip`;
     const tmpDir = `/tmp/wm-recon-${reportDate}`;
-    require('fs').writeFileSync(tmpZip, zipBuffer);
+    writeFileSync(tmpZip, zipBuffer);
     execSync(`mkdir -p ${tmpDir} && cd ${tmpDir} && unzip -o ${tmpZip} 2>/dev/null`, { encoding: 'utf8' });
 
     // Find CSV
