@@ -1,0 +1,14 @@
+#!/bin/bash
+# Re-export JSONL before commit so bv always has fresh data
+if command -v bd >/dev/null 2>&1 && [ -f ".beads/issues.jsonl" ]; then
+  bd list --json --all 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    with open('.beads/issues.jsonl', 'w') as f:
+        for d in data:
+            f.write(json.dumps(d) + '\n')
+except: pass
+" 2>/dev/null
+  git add .beads/issues.jsonl 2>/dev/null
+fi
