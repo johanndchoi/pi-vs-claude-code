@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-03-03T20:29:12.953Z",
+  "updatedAt": "2026-03-05T17:31:46.554Z",
   "createdAt": "2026-03-02T19:34:39.786Z",
   "id": "VkYsADlbTWkHkLtA",
   "name": "Production Line Image Identifier (Supabase)",
@@ -30,8 +30,8 @@
       "type": "n8n-nodes-base.googleDriveTrigger",
       "typeVersion": 1,
       "position": [
-        2512,
-        1088
+        2160,
+        1072
       ],
       "id": "5401fdc8-70b3-4a12-901c-acd4b8fde843",
       "name": "Google Drive Trigger",
@@ -90,7 +90,7 @@
       "type": "n8n-nodes-tesseractjs.tesseractNode",
       "typeVersion": 1,
       "position": [
-        3184,
+        3120,
         800
       ],
       "id": "cd7dc0ef-49e0-420d-95c3-6a9a851b4970",
@@ -103,7 +103,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        3472,
+        3296,
         800
       ],
       "id": "de9a87c2-60fa-406a-8c3f-84ffadfd3198",
@@ -123,7 +123,7 @@
       "type": "n8n-nodes-base.googleDrive",
       "typeVersion": 3,
       "position": [
-        3696,
+        3472,
         800
       ],
       "id": "a69e3ca4-0cbe-40ce-8930-3130286c04cb",
@@ -137,44 +137,10 @@
     },
     {
       "parameters": {
-        "url": "=https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/shipments?tracking_number=eq.{{ $('Rename to Tracking Number').item.json.name }}&select=id,tracking_number,carrier_name,order_id",
-        "authentication": "none",
-        "options": {
-          "response": {
-            "response": {
-              "responseFormat": "json"
-            }
-          }
-        },
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "apikey",
-              "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNrZ3pjbGxvbWhzbXBia2RucXFjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjE0NDMwMywiZXhwIjoyMDg3NzIwMzAzfQ.1EFO3yNLwBz3Ov70tGDGCwC_bupXaBc8j-JpBZ_LuY0"
-            },
-            {
-              "name": "Authorization",
-              "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNrZ3pjbGxvbWhzbXBia2RucXFjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjE0NDMwMywiZXhwIjoyMDg3NzIwMzAzfQ.1EFO3yNLwBz3Ov70tGDGCwC_bupXaBc8j-JpBZ_LuY0"
-            }
-          ]
-        }
-      },
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.3,
-      "position": [
-        4128,
-        800
-      ],
-      "id": "eae94ab9-e945-4ef2-b8ce-feb328c50fae",
-      "name": "Find Shipment in Supabase"
-    },
-    {
-      "parameters": {
         "method": "POST",
-        "url": "=https://skgzcllomhsmpbkdnqqc.supabase.co/storage/v1/object/shipment-photos/matched/{{ $('Extract Tracking Number').item.json.trackingNumber }}/{{ $now.format('yyyy-MM-dd_HH-mm-ss') }}.{{ $('Download file').item.binary.data.fileExtension || 'jpg' }}",
-        "authentication": "none",
-        "genericAuthType": "httpHeaderAuth",
+        "url": "={{ $(\"Normalize Result\").item.json.upload_url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -185,21 +151,12 @@
             {
               "name": "x-upsert",
               "value": "true"
-            },
-            {
-              "name": "apikey",
-              "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNrZ3pjbGxvbWhzbXBia2RucXFjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjE0NDMwMywiZXhwIjoyMDg3NzIwMzAzfQ.1EFO3yNLwBz3Ov70tGDGCwC_bupXaBc8j-JpBZ_LuY0"
-            },
-            {
-              "name": "Authorization",
-              "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNrZ3pjbGxvbWhzbXBia2RucXFjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjE0NDMwMywiZXhwIjoyMDg3NzIwMzAzfQ.1EFO3yNLwBz3Ov70tGDGCwC_bupXaBc8j-JpBZ_LuY0"
             }
           ]
         },
         "sendBody": true,
-        "contentType": "raw",
-        "rawContentType": "={{ $('Download file').item.binary.data.mimeType }}",
-        "body": "={{ $('Download file').item.binary.data }}",
+        "contentType": "binaryData",
+        "inputDataFieldName": "data",
         "options": {
           "response": {
             "response": {
@@ -211,18 +168,24 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.3,
       "position": [
-        4336,
+        4016,
         800
       ],
       "id": "6c2de39f-f8ee-44b4-87cf-c7c0cf1eceb8",
-      "name": "Upload Photo to Supabase Storage"
+      "name": "Upload Photo to Supabase Storage",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
     },
     {
       "parameters": {
         "method": "POST",
         "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/shipment_photos",
-        "authentication": "none",
-        "genericAuthType": "httpHeaderAuth",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -233,20 +196,54 @@
             {
               "name": "Prefer",
               "value": "return=representation"
-            },
-            {
-              "name": "apikey",
-              "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNrZ3pjbGxvbWhzbXBia2RucXFjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjE0NDMwMywiZXhwIjoyMDg3NzIwMzAzfQ.1EFO3yNLwBz3Ov70tGDGCwC_bupXaBc8j-JpBZ_LuY0"
-            },
-            {
-              "name": "Authorization",
-              "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNrZ3pjbGxvbWhzbXBia2RucXFjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjE0NDMwMywiZXhwIjoyMDg3NzIwMzAzfQ.1EFO3yNLwBz3Ov70tGDGCwC_bupXaBc8j-JpBZ_LuY0"
             }
           ]
         },
         "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={\n  \"shipment_id\": {{ $('Find Shipment in Supabase').item.json[0]?.id ? '\"' + $('Find Shipment in Supabase').item.json[0].id + '\"' : 'null' }},\n  \"tracking_number\": \"{{ $('Extract Tracking Number').item.json.trackingNumber }}\",\n  \"storage_path\": \"matched/{{ $('Extract Tracking Number').item.json.trackingNumber }}/{{ $now.format('yyyy-MM-dd_HH-mm-ss') }}.{{ $('Download file').item.binary.data.fileExtension || 'jpg' }}\",\n  \"ocr_raw\": {{ JSON.stringify($('Extract Tracking Number').item.json.ocrRaw || '') }},\n  \"ocr_confidence\": {{ $('Extract Tracking Number').item.json.ocrConfidence || 0 }},\n  \"drive_file_id\": \"{{ $('Download file').item.json.id }}\",\n  \"file_size_bytes\": {{ $('Download file').item.binary.data.fileSize || 0 }},\n  \"mime_type\": \"{{ $('Download file').item.binary.data.mimeType || 'image/jpeg' }}\",\n  \"matched\": {{ $('Find Shipment in Supabase').item.json.length > 0 }},\n  \"match_method\": {{ $('Find Shipment in Supabase').item.json.length > 0 ? '\"exact\"' : 'null' }}\n}",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "shipment_id",
+              "value": "={{ $(\"Normalize Result\").item.json.photo_record.shipment_id || undefined }}"
+            },
+            {
+              "name": "tracking_number",
+              "value": "={{ $(\"Normalize Result\").item.json.photo_record.tracking_number }}"
+            },
+            {
+              "name": "storage_path",
+              "value": "={{ $(\"Normalize Result\").item.json.photo_record.storage_path }}"
+            },
+            {
+              "name": "ocr_raw",
+              "value": "={{ $(\"Normalize Result\").item.json.photo_record.ocr_raw }}"
+            },
+            {
+              "name": "ocr_confidence",
+              "value": "={{ $(\"Normalize Result\").item.json.photo_record.ocr_confidence }}"
+            },
+            {
+              "name": "drive_file_id",
+              "value": "={{ $(\"Normalize Result\").item.json.photo_record.drive_file_id }}"
+            },
+            {
+              "name": "file_size_bytes",
+              "value": "={{ $(\"Normalize Result\").item.json.photo_record.file_size_bytes }}"
+            },
+            {
+              "name": "mime_type",
+              "value": "={{ $(\"Normalize Result\").item.json.photo_record.mime_type }}"
+            },
+            {
+              "name": "matched",
+              "value": "={{ $(\"Normalize Result\").item.json.photo_record.matched }}"
+            },
+            {
+              "name": "match_method",
+              "value": "={{ $(\"Normalize Result\").item.json.photo_record.match_method || undefined }}"
+            }
+          ]
+        },
         "options": {
           "response": {
             "response": {
@@ -258,11 +255,17 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.3,
       "position": [
-        4560,
+        4208,
         800
       ],
       "id": "d15be7b3-7fad-4b43-beaf-cb918505f349",
-      "name": "Create Photo Record"
+      "name": "Create Photo Record",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
     },
     {
       "parameters": {
@@ -289,7 +292,7 @@
       "type": "n8n-nodes-base.googleDrive",
       "typeVersion": 3,
       "position": [
-        4784,
+        4384,
         800
       ],
       "id": "3c267950-0897-42a9-b7ce-98d795aeb604",
@@ -319,7 +322,7 @@
       "type": "n8n-nodes-base.googleDrive",
       "typeVersion": 3,
       "position": [
-        2352,
+        2176,
         784
       ],
       "id": "c86075aa-173e-4004-a9af-c6ae39d3fd6b",
@@ -333,7 +336,6 @@
     },
     {
       "parameters": {
-        "batchSize": 25,
         "options": {}
       },
       "type": "n8n-nodes-base.splitInBatches",
@@ -350,11 +352,53 @@
       "type": "n8n-nodes-base.manualTrigger",
       "typeVersion": 1,
       "position": [
-        2112,
+        1936,
         784
       ],
       "id": "df7da292-e4c2-43b3-8394-149f5204edc5",
       "name": "When clicking 'Execute workflow'"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "tableId": "shipments",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "tracking_number",
+              "keyValue": "={{ $json.name || $json.trackingNumber }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        3632,
+        800
+      ],
+      "id": "8082061e-4970-410e-b7ad-bd1381f4435e",
+      "name": "Get a row",
+      "alwaysOutputData": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize shipment result + build photo record payload\nconst items = $input.all();\nconst raw = items[0]?.json || {};\nconst shipment = raw.id ? raw : null;\n\nconst trackingNumber = $(\"Rename to Tracking Number\").item.json.name ||\n                       $(\"Extract Tracking Number\").item.json.trackingNumber || \"\";\n\nconst matched = !!shipment;\nconst folder = matched ? \"matched\" : \"unmatched\";\nconst ts = new Date().toISOString().replace(/[:.]/g, \"-\").slice(0, 19);\nconst ext = $(\"Download file\").item.binary?.data?.fileExtension || \"jpg\";\nconst storagePath = folder + \"/\" + trackingNumber + \"/\" + ts + \".\" + ext;\n\nconst ocrRaw = $(\"Extract Tracking Number\").item.json.ocrRaw || \"\";\nconst ocrConfidence = $(\"Extract Tracking Number\").item.json.ocrConfidence || 0;\nconst driveFileId = $(\"Download file\").item.json.id || \"\";\n// Parse fileSize: n8n gives \"317 kB\" not raw bytes\nconst fileSizeRaw = $(\"Download file\").item.binary?.data?.fileSize || \"0\";\nconst fileSizeParsed = (() => {\n    const s = String(fileSizeRaw).trim();\n    const m = s.match(/^([\\d.]+)\\s*(kB|MB|GB|bytes?)?$/i);\n    if (!m) return parseInt(s) || 0;\n    const num = parseFloat(m[1]);\n    const unit = (m[2] || \"\").toLowerCase();\n    if (unit === \"kb\") return Math.round(num * 1024);\n    if (unit === \"mb\") return Math.round(num * 1024 * 1024);\n    if (unit === \"gb\") return Math.round(num * 1024 * 1024 * 1024);\n    return Math.round(num);\n})();\nconst fileSize = fileSizeParsed;\nconst mimeType = $(\"Download file\").item.binary?.data?.mimeType || \"image/jpeg\";\n\n// Pass through binary from Download file so Upload can send it\nconst binaryData = $(\"Download file\").item.binary || {};\n\nreturn [{\n    json: {\n        matched,\n        shipment_id: shipment ? shipment.id : null,\n        tracking_number: trackingNumber,\n        carrier_name: shipment ? shipment.carrier_name : null,\n        order_id: shipment ? shipment.order_id : null,\n        storage_path: storagePath,\n        upload_url: \"https://skgzcllomhsmpbkdnqqc.supabase.co/storage/v1/object/shipment-photos/\" + storagePath,\n        photo_record: {\n            shipment_id: shipment ? shipment.id : null,\n            tracking_number: trackingNumber,\n            storage_path: storagePath,\n            ocr_raw: ocrRaw,\n            ocr_confidence: ocrConfidence,\n            drive_file_id: driveFileId,\n            file_size_bytes: fileSize,\n            mime_type: mimeType,\n            matched: matched,\n            match_method: matched ? \"exact\" : null\n        }    },\n    binary: binaryData\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3824,
+        800
+      ],
+      "id": "normalize-result-001",
+      "name": "Normalize Result"
     }
   ],
   "connections": {
@@ -362,7 +406,7 @@
       "main": [
         [
           {
-            "node": "Download file",
+            "node": "Loop Over Items",
             "type": "main",
             "index": 0
           }
@@ -417,18 +461,7 @@
       "main": [
         [
           {
-            "node": "Find Shipment in Supabase",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Find Shipment in Supabase": {
-      "main": [
-        [
-          {
-            "node": "Upload Photo to Supabase Storage",
+            "node": "Get a row",
             "type": "main",
             "index": 0
           }
@@ -501,6 +534,28 @@
           }
         ]
       ]
+    },
+    "Get a row": {
+      "main": [
+        [
+          {
+            "node": "Normalize Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Result": {
+      "main": [
+        [
+          {
+            "node": "Upload Photo to Supabase Storage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "settings": {
@@ -514,9 +569,9 @@
     "templateCredsSetupCompleted": true
   },
   "pinData": {},
-  "versionId": "04934936-1ab8-4f09-ab31-95f1dce158c3",
+  "versionId": "552dbf63-6663-4c59-8a93-7286d341c9c2",
   "activeVersionId": null,
-  "versionCounter": 32,
+  "versionCounter": 86,
   "triggerCount": 0,
   "shared": [
     {
