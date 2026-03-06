@@ -1,0 +1,698 @@
+{
+  "name": "Sync: Veeqo Orders",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 400],
+      "id": "a0000001-0000-0000-0000-000000000001",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/sync_cursors",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "source", "value": "eq.veeqo_orders" },
+            { "name": "select", "value": "id,cursor_value" },
+            { "name": "limit", "value": "1" }
+          ]
+        },
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [300, 400],
+      "id": "a0000001-0000-0000-0000-000000000002",
+      "name": "Get Sync Cursor",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/channels",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "select", "value": "id,external_id" }
+          ]
+        },
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [600, 200],
+      "id": "a0000001-0000-0000-0000-000000000003",
+      "name": "Get Channels",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/warehouses",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "select", "value": "id,external_id" }
+          ]
+        },
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [600, 400],
+      "id": "a0000001-0000-0000-0000-000000000004",
+      "name": "Get Warehouses",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/product_variants",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "select", "value": "id,sku,cost_price" }
+          ]
+        },
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [600, 600],
+      "id": "a0000001-0000-0000-0000-000000000005",
+      "name": "Get Variants",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build lookup caches from preceding HTTP nodes\nconst cursorData = $('Get Sync Cursor').all().map(i => i.json).flat();\nconst channels = $('Get Channels').all().map(i => i.json).flat();\nconst warehouses = $('Get Warehouses').all().map(i => i.json).flat();\nconst variants = $('Get Variants').all().map(i => i.json).flat();\n\nconst channelCache = {};\nfor (const c of (Array.isArray(channels) ? channels : [channels])) {\n  if (c && c.external_id) channelCache[String(c.external_id)] = c.id;\n}\n\nconst warehouseCache = {};\nfor (const w of (Array.isArray(warehouses) ? warehouses : [warehouses])) {\n  if (w && w.external_id) warehouseCache[String(w.external_id)] = w.id;\n}\n\nconst variantCache = {};\nconst costPriceCache = {};\nfor (const v of (Array.isArray(variants) ? variants : [variants])) {\n  if (v && v.sku) {\n    variantCache[v.sku] = v.id;\n    if (v.cost_price > 0) costPriceCache[v.sku] = +v.cost_price;\n  }\n}\n\nconst cursor = Array.isArray(cursorData) ? cursorData[0] : cursorData;\nconst sinceDate = cursor?.cursor_value || null;\nconst cursorId = cursor?.id || null;\n\nreturn [{\n  json: {\n    sinceDate,\n    cursorId,\n    channelCache,\n    warehouseCache,\n    variantCache,\n    costPriceCache,\n    cacheStats: {\n      channels: Object.keys(channelCache).length,\n      warehouses: Object.keys(warehouseCache).length,\n      variants: Object.keys(variantCache).length\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 400],
+      "id": "a0000001-0000-0000-0000-000000000006",
+      "name": "Build Config"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/import_runs",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ source: 'veeqo', job_name: 'veeqo_orders_sync', status: 'running', cursor_start: $('Build Config').first().json.sinceDate || 'full' }) }}",
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [1200, 400],
+      "id": "a0000001-0000-0000-0000-000000000007",
+      "name": "Create Import Run",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.veeqo.com/orders",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "page_size", "value": "100" },
+            { "name": "page", "value": "1" },
+            { "name": "created_at_min", "value": "={{ $('Build Config').first().json.sinceDate || '2020-01-01' }}" }
+          ]
+        },
+        "options": {
+          "response": { "response": { "responseFormat": "json" } },
+          "pagination": {
+            "paginationMode": "updateAParameterInEachRequest",
+            "parameters": {
+              "parametersUi": {
+                "parameter": [
+                  {
+                    "type": "queryString",
+                    "name": "page",
+                    "value": "={{ $request.qs.page ? Number($request.qs.page) + 1 : 2 }}"
+                  }
+                ]
+              }
+            },
+            "paginationCompleteWhen": "other",
+            "completeExpression": "={{ $response.body.length < 100 }}",
+            "requestInterval": 200,
+            "maxRequests": 100
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [1500, 400],
+      "id": "a0000001-0000-0000-0000-000000000008",
+      "name": "Fetch All Orders",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "3HIHmn9LaxU03JrD",
+          "name": "Veeqo API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {
+          "reset": false
+        }
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1800, 400],
+      "id": "a0000001-0000-0000-0000-000000000009",
+      "name": "Loop Over Orders"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Transform a single Veeqo order into all entity payloads\nconst order = $input.item.json;\nconst config = $('Build Config').first().json;\n\n// ─── Status mapping ───\nconst statusMap = {\n  awaiting_payment: 'awaiting_payment',\n  awaiting_fulfillment: 'awaiting_fulfillment',\n  partially_fulfilled: 'partially_shipped',\n  shipped: 'shipped',\n  delivered: 'delivered',\n  cancelled: 'cancelled',\n  on_hold: 'on_hold',\n  refunded: 'refunded'\n};\nconst orderStatus = statusMap[order.status] || 'pending';\n\n// ─── Customer ───\nconst cust = order.customer;\nconst deliverTo = order.deliver_to;\nconst email = cust?.email || deliverTo?.email || null;\nconst firstName = cust?.full_name?.split(' ')[0] || deliverTo?.first_name || null;\nconst lastName = cust?.full_name?.split(' ').slice(1).join(' ') || deliverTo?.last_name || null;\nconst phone = cust?.phone || cust?.mobile || deliverTo?.phone || null;\n\nconst customer = (email || firstName) ? {\n  first_name: firstName,\n  last_name: lastName,\n  email,\n  phone,\n  customer_type: cust?.customer_type || 'retail',\n  channel_customer_ids: { veeqo: String(cust?.id || '') }\n} : null;\n\n// ─── Addresses ───\nconst shippingAddress = deliverTo?.address1 ? {\n  address_type: 'shipping',\n  first_name: deliverTo.first_name || null,\n  last_name: deliverTo.last_name || null,\n  company: deliverTo.company || null,\n  address_line_1: deliverTo.address1,\n  address_line_2: deliverTo.address2 || null,\n  city: deliverTo.city || deliverTo.city_locality || '',\n  state: deliverTo.state || deliverTo.state_province || null,\n  country: deliverTo.country || deliverTo.country_code || 'US',\n  postal_code: deliverTo.zip || deliverTo.postal_code || '',\n  phone: deliverTo.phone || null,\n  email: deliverTo.email || null,\n  is_verified: deliverTo.verified || false,\n  is_residential: deliverTo.residential !== false\n} : null;\n\nconst ba = order.billing_address;\nconst billingAddress = ba?.address1 ? {\n  address_type: 'billing',\n  first_name: ba.first_name || null,\n  last_name: ba.last_name || null,\n  company: ba.company || null,\n  address_line_1: ba.address1,\n  address_line_2: ba.address2 || null,\n  city: ba.city || ba.city_locality || '',\n  state: ba.state || ba.state_province || null,\n  country: ba.country || ba.country_code || 'US',\n  postal_code: ba.zip || ba.postal_code || '',\n  phone: ba.phone || null,\n  email: ba.email || null\n} : null;\n\n// ─── Resolve cache lookups ───\nconst channelId = config.channelCache[String(order.channel?.id)] || null;\nconst warehouseId = config.warehouseCache[String(order.allocations?.[0]?.warehouse?.id)] || null;\n\n// ─── Order record (IDs filled in later) ───\nconst orderRecord = {\n  order_number: order.number || String(order.id),\n  channel_id: channelId,\n  status: orderStatus,\n  subtotal: +(order.subtotal_price || 0),\n  shipping_cost: +(order.delivery_cost || 0),\n  tax_amount: +(order.total_tax || 0),\n  discount_amount: +(order.total_discounts || 0),\n  total: +(order.total_price || 0),\n  currency_code: order.currency_code || 'USD',\n  ordered_at: order.created_at,\n  shipped_at: order.shipped_at || null,\n  cancelled_at: order.cancelled_at || null,\n  warehouse_id: warehouseId,\n  delivery_method: order.delivery_method?.name || null,\n  is_prime: order.is_amazon_prime || false,\n  fulfilled_by: order.fulfilled_by_amazon ? 'fba' : 'merchant',\n  customer_notes: order.customer_note?.text || null,\n  internal_notes: order.notes || null,\n  tags: (order.tags || []).map(t => t.name),\n  data_source: 'veeqo',\n  external_ids: { veeqo: String(order.id) }\n};\n\n// ─── Line items ───\nconst lineItems = (order.line_items || []).map(li => {\n  const sku = li.sellable?.sku_code || 'UNKNOWN';\n  return {\n    sku,\n    variant_id: config.variantCache[sku] || null,\n    title: li.title || li.sellable?.product_title || '',\n    quantity: li.quantity || 1,\n    unit_price: +(li.price_per_unit || 0),\n    tax_rate: +(li.tax_rate || 0),\n    tax_amount: +((li.price_per_unit || 0) * (li.quantity || 1) * (li.tax_rate || 0)).toFixed(2),\n    discount_amount: +(li.taxless_discount_per_unit || 0) * (li.quantity || 1),\n    cost_price: +(li.sellable?.cost_price || 0) || (config.costPriceCache[sku] || 0),\n    remote_line_id: li.remote_id ? String(li.remote_id) : null\n  };\n});\n\n// ─── Tracking URL builder ───\nfunction buildTrackingUrl(tn, carrierName) {\n  if (!tn) return null;\n  tn = tn.trim();\n  const carrier = (carrierName || '').toLowerCase();\n  if (tn.startsWith('1Z') || carrier.includes('ups')) return 'https://www.ups.com/track?track=yes&trackNums=' + tn;\n  if (carrier.includes('fedex') || /^\\d{12,22}$/.test(tn)) return 'https://www.fedex.com/fedextrack/?trknbr=' + tn;\n  if (carrier.includes('usps') || carrier.includes('stamps') || /^9\\d{19,33}$/.test(tn)) return 'https://tools.usps.com/go/TrackConfirmAction?tLabels=' + tn;\n  if (carrier.includes('ontrac') || /^[CD]\\d{10,20}$/.test(tn)) return 'https://www.ontrac.com/tracking/?number=' + tn;\n  if (tn.startsWith('TBA')) return 'https://track.amazon.com/tracking/' + tn;\n  return 'https://aftership.com/track/' + tn;\n}\n\n// ─── Shipment status mapping ───\nfunction mapShipmentStatus(tracking) {\n  if (!tracking) return 'created';\n  if (tracking.delivered_at) return 'delivered';\n  if (tracking.out_for_delivery_at) return 'out_for_delivery';\n  if (tracking.in_transit_at) return 'in_transit';\n  if (tracking.awaiting_collection_at) return 'awaiting_collection';\n  if (tracking.cancelled_at) return 'cancelled';\n  if (tracking.returned_to_sender_at) return 'returned_to_sender';\n  if (tracking.attempted_delivery_at) return 'attempted_delivery';\n  return 'created';\n}\n\n// ─── Shipments ───\nconst shipments = [];\nconst trackingEvents = [];\nfor (const alloc of (order.allocations || [])) {\n  const ship = alloc.shipment;\n  if (!ship) continue;\n  const tracking = ship.tracking_number || ship.tracking || ship.trackings?.[0];\n  const trackingNumber = tracking?.tracking_number || null;\n  const carrierName = ship.carrier?.name || null;\n  const carrierCode = ship.carrier?.slug || ship.carrier?.provider_type || null;\n\n  const shipment = {\n    _veeqo_id: String(ship.id),\n    warehouse_id: warehouseId,\n    status: mapShipmentStatus(tracking),\n    label_source: carrierCode === 'buy-shipping' ? 'amazon_buy_shipping' : 'veeqo',\n    data_source: 'veeqo',\n    carrier_name: carrierName,\n    carrier_code: carrierCode,\n    carrier_service: ship.service_name || ship.short_service_name || ship.carrier_service_name || null,\n    service_code: ship.service_type || null,\n    tracking_number: trackingNumber,\n    tracking_url: buildTrackingUrl(trackingNumber, carrierName),\n    label_created_at: ship.created_at || null,\n    shipped_at: ship.created_at || ship.shipped_at || null,\n    delivered_at: tracking?.delivered_at || null,\n    label_cost: ship.outbound_label_charges?.value ?? (ship.cost ? +ship.cost : null),\n    insurance_cost: ship.insurance_charges?.value ?? null,\n    total_cost: (ship.outbound_label_charges?.value ?? 0) + (ship.insurance_charges?.value ?? 0) || null,\n    weight_oz: alloc.total_weight || null,\n    is_voided: tracking?.cancelled || false,\n    voided_at: tracking?.cancelled_at || null,\n    external_ids: { veeqo: String(ship.id) }\n  };\n\n  const pkg = alloc.allocation_package;\n  if (pkg) {\n    shipment.length_in = pkg.depth || null;\n    shipment.width_in = pkg.width || null;\n    shipment.height_in = pkg.height || null;\n    shipment.package_type = pkg.package_name || null;\n  }\n  shipments.push(shipment);\n\n  // Tracking events from timestamp fields\n  if (tracking && trackingNumber) {\n    const tsFields = [\n      ['created', 'Label created', tracking.created_at],\n      ['awaiting_collection', 'Awaiting collection', tracking.awaiting_collection_at],\n      ['in_transit', 'In transit', tracking.in_transit_at],\n      ['out_for_delivery', 'Out for delivery', tracking.out_for_delivery_at],\n      ['delivered', 'Delivered', tracking.delivered_at],\n      ['attempted_delivery', 'Delivery attempted', tracking.attempted_delivery_at],\n      ['returned_to_sender', 'Returned to sender', tracking.returned_to_sender_at],\n      ['cancelled', 'Cancelled', tracking.cancelled_at]\n    ];\n    for (const [status, desc, ts] of tsFields) {\n      if (ts) {\n        trackingEvents.push({\n          _veeqo_ship_id: String(ship.id),\n          tracking_number: trackingNumber,\n          status,\n          description: desc,\n          occurred_at: ts\n        });\n      }\n    }\n  }\n}\n\nreturn [{\n  json: {\n    customer,\n    shippingAddress,\n    billingAddress,\n    order: orderRecord,\n    lineItems,\n    shipments,\n    trackingEvents,\n    veeqoId: String(order.id)\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2100, 400],
+      "id": "a0000001-0000-0000-0000-000000000010",
+      "name": "Transform Order"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/customers",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation,resolution=merge-duplicates" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.customer ? JSON.stringify($json.customer) : '[]' }}",
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [2400, 400],
+      "id": "a0000001-0000-0000-0000-000000000011",
+      "name": "Upsert Customer",
+      "continueOnFail": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/addresses",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation,resolution=merge-duplicates" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ (() => { const t = $('Transform Order').first().json; const custId = (Array.isArray($json) ? $json[0] : $json)?.id || null; const addrs = []; if (t.shippingAddress) addrs.push({...t.shippingAddress, customer_id: custId}); if (t.billingAddress) addrs.push({...t.billingAddress, customer_id: custId}); return addrs.length ? JSON.stringify(addrs) : '[]'; })() }}",
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [2700, 400],
+      "id": "a0000001-0000-0000-0000-000000000012",
+      "name": "Upsert Addresses",
+      "continueOnFail": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the final order payload with all resolved IDs\nconst t = $('Transform Order').first().json;\nconst custResult = $('Upsert Customer').all().map(i => i.json).flat();\nconst addrResult = $('Upsert Addresses').all().map(i => i.json).flat();\n\n// Resolve customer ID\nconst custArr = Array.isArray(custResult) ? custResult : [custResult];\nconst customerId = custArr[0]?.id || null;\n\n// Resolve address IDs\nconst addrArr = Array.isArray(addrResult) ? addrResult : [addrResult];\nlet shippingAddrId = null;\nlet billingAddrId = null;\nfor (const a of addrArr) {\n  if (a?.address_type === 'shipping') shippingAddrId = a.id;\n  if (a?.address_type === 'billing') billingAddrId = a.id;\n}\n\nconst order = {\n  ...t.order,\n  customer_id: customerId,\n  shipping_address_id: shippingAddrId,\n  billing_address_id: billingAddrId\n};\n\nreturn [{\n  json: {\n    order,\n    lineItems: t.lineItems,\n    shipments: t.shipments,\n    trackingEvents: t.trackingEvents\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3000, 400],
+      "id": "a0000001-0000-0000-0000-000000000013",
+      "name": "Build Order Payload"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/orders",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation,resolution=merge-duplicates" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.order) }}",
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [3300, 400],
+      "id": "a0000001-0000-0000-0000-000000000014",
+      "name": "Upsert Order",
+      "continueOnFail": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build line items and shipments with the resolved order_id\nconst prev = $('Build Order Payload').first().json;\nconst orderResult = $('Upsert Order').all().map(i => i.json).flat();\nconst orderArr = Array.isArray(orderResult) ? orderResult : [orderResult];\nconst orderId = orderArr[0]?.id || null;\n\nconst lineItems = prev.lineItems.map(li => ({ ...li, order_id: orderId }));\n\nconst shipments = prev.shipments.map(s => {\n  const { _veeqo_id, ...rest } = s;\n  return { ...rest, order_id: orderId };\n});\n\nreturn [{\n  json: {\n    orderId,\n    lineItems,\n    shipments,\n    trackingEvents: prev.trackingEvents,\n    shipmentsRaw: prev.shipments\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3600, 400],
+      "id": "a0000001-0000-0000-0000-000000000015",
+      "name": "Build Related Records"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/order_items",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation,resolution=merge-duplicates" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.lineItems && $json.lineItems.length > 0 ? JSON.stringify($json.lineItems) : '[]' }}",
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [3900, 400],
+      "id": "a0000001-0000-0000-0000-000000000016",
+      "name": "Upsert Line Items",
+      "continueOnFail": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/shipments",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation,resolution=merge-duplicates" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ (() => { const r = $('Build Related Records').first().json; return r.shipments && r.shipments.length > 0 ? JSON.stringify(r.shipments) : '[]'; })() }}",
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [4200, 400],
+      "id": "a0000001-0000-0000-0000-000000000017",
+      "name": "Upsert Shipments",
+      "continueOnFail": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Map tracking events to resolved shipment IDs\nconst prev = $('Build Related Records').first().json;\nconst shipResult = $('Upsert Shipments').all().map(i => i.json).flat();\nconst shipArr = Array.isArray(shipResult) ? shipResult : [shipResult];\n\n// Build mapping: veeqo_id -> supabase shipment_id\nconst idMap = {};\nfor (const s of shipArr) {\n  if (s?.external_ids?.veeqo) {\n    idMap[s.external_ids.veeqo] = s.id;\n  }\n}\n\nconst trackingEvents = (prev.trackingEvents || []).map(te => {\n  const { _veeqo_ship_id, ...rest } = te;\n  return { ...rest, shipment_id: idMap[_veeqo_ship_id] || null };\n}).filter(te => te.shipment_id);\n\nreturn [{\n  json: { trackingEvents }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [4500, 400],
+      "id": "a0000001-0000-0000-0000-000000000018",
+      "name": "Build Tracking Events"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/tracking_events",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation,resolution=merge-duplicates" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.trackingEvents && $json.trackingEvents.length > 0 ? JSON.stringify($json.trackingEvents) : '[]' }}",
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [4800, 400],
+      "id": "a0000001-0000-0000-0000-000000000019",
+      "name": "Upsert Tracking Events",
+      "continueOnFail": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/sync_cursors",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation,resolution=merge-duplicates" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ source: 'veeqo_orders', cursor_value: new Date().toISOString(), last_synced_at: new Date().toISOString() }) }}",
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [2100, 700],
+      "id": "a0000001-0000-0000-0000-000000000020",
+      "name": "Update Sync Cursor",
+      "continueOnFail": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ 'https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/import_runs?id=eq.' + (Array.isArray($('Create Import Run').first().json) ? $('Create Import Run').first().json[0].id : $('Create Import Run').first().json.id) }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ status: 'completed', completed_at: new Date().toISOString(), cursor_end: new Date().toISOString() }) }}",
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [2400, 700],
+      "id": "a0000001-0000-0000-0000-000000000021",
+      "name": "Finalize Import Run",
+      "continueOnFail": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          { "node": "Get Sync Cursor", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Get Sync Cursor": {
+      "main": [
+        [
+          { "node": "Get Channels", "type": "main", "index": 0 },
+          { "node": "Get Warehouses", "type": "main", "index": 0 },
+          { "node": "Get Variants", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Get Channels": {
+      "main": [
+        [
+          { "node": "Build Config", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Get Warehouses": {
+      "main": [
+        [
+          { "node": "Build Config", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Get Variants": {
+      "main": [
+        [
+          { "node": "Build Config", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Build Config": {
+      "main": [
+        [
+          { "node": "Create Import Run", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Create Import Run": {
+      "main": [
+        [
+          { "node": "Fetch All Orders", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Fetch All Orders": {
+      "main": [
+        [
+          { "node": "Loop Over Orders", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Loop Over Orders": {
+      "main": [
+        [
+          { "node": "Update Sync Cursor", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Transform Order", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Transform Order": {
+      "main": [
+        [
+          { "node": "Upsert Customer", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Upsert Customer": {
+      "main": [
+        [
+          { "node": "Upsert Addresses", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Upsert Addresses": {
+      "main": [
+        [
+          { "node": "Build Order Payload", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Build Order Payload": {
+      "main": [
+        [
+          { "node": "Upsert Order", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Upsert Order": {
+      "main": [
+        [
+          { "node": "Build Related Records", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Build Related Records": {
+      "main": [
+        [
+          { "node": "Upsert Line Items", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Upsert Line Items": {
+      "main": [
+        [
+          { "node": "Upsert Shipments", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Upsert Shipments": {
+      "main": [
+        [
+          { "node": "Build Tracking Events", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Build Tracking Events": {
+      "main": [
+        [
+          { "node": "Upsert Tracking Events", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Upsert Tracking Events": {
+      "main": [
+        [
+          { "node": "Loop Over Orders", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Update Sync Cursor": {
+      "main": [
+        [
+          { "node": "Finalize Import Run", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "pinData": {},
+  "tags": []
+}

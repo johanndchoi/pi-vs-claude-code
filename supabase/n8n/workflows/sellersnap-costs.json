@@ -1,0 +1,318 @@
+{
+  "name": "Sync: SellerSnap Costs",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300],
+      "id": "a1b2c3d4-0001-4000-8000-000000000001",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api4.sellersnap.io/store/30206/listings/data",
+        "authentication": "genericCredentialType",
+        "genericCredentialType": "httpBasicAuth",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300],
+      "id": "a1b2c3d4-0002-4000-8000-000000000002",
+      "name": "Fetch Amazon Listings",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "b4jgA0UcxjCCJuq0",
+          "name": "SellerSnap API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api4.sellersnap.io/store/31069/listings/data",
+        "authentication": "genericCredentialType",
+        "genericCredentialType": "httpBasicAuth",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300],
+      "id": "a1b2c3d4-0003-4000-8000-000000000003",
+      "name": "Fetch Walmart Listings",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "b4jgA0UcxjCCJuq0",
+          "name": "SellerSnap API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge cost data from both stores (Amazon takes priority)\nconst amazonData = $('Fetch Amazon Listings').first().json;\nconst walmartData = $('Fetch Walmart Listings').first().json;\n\nconst amazonListings = amazonData?.data || [];\nconst walmartListings = walmartData?.data || [];\n\nconst allCosts = {};\n\n// Process Walmart first\nfor (const item of walmartListings) {\n  if (!item.sku || !item.cost || item.cost === '0.00') continue;\n  const totalCost = +(+item.cost + +(item.additional_cost || 0)).toFixed(2);\n  allCosts[item.sku] = totalCost;\n}\n\n// Amazon overwrites Walmart (preferred source)\nfor (const item of amazonListings) {\n  if (!item.sku || !item.cost || item.cost === '0.00') continue;\n  const totalCost = +(+item.cost + +(item.additional_cost || 0)).toFixed(2);\n  allCosts[item.sku] = totalCost;\n}\n\nconsole.log(`Amazon: ${amazonListings.length} listings, Walmart: ${walmartListings.length} listings`);\nconsole.log(`Total unique SKUs with cost: ${Object.keys(allCosts).length}`);\n\nreturn Object.entries(allCosts).map(([sku, cost_price]) => ({\n  json: { sku, cost_price }\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300],
+      "id": "a1b2c3d4-0004-4000-8000-000000000004",
+      "name": "Build Cost Map"
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1120, 300],
+      "id": "a1b2c3d4-0005-4000-8000-000000000005",
+      "name": "Loop Over SKUs"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/product_variants",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "sku",
+              "value": "=eq.{{ $json.sku }}"
+            },
+            {
+              "name": "cost_price",
+              "value": "=neq.{{ $json.cost_price }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "return=headers-only"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"cost_price\": {{ $json.cost_price }}}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 200],
+      "id": "a1b2c3d4-0006-4000-8000-000000000006",
+      "name": "Update Product Variants",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/order_items",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "sku",
+              "value": "=eq.{{ $json.sku }}"
+            },
+            {
+              "name": "cost_price",
+              "value": "eq.0"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "count=exact"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"cost_price\": {{ $json.cost_price }}}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 200],
+      "id": "a1b2c3d4-0007-4000-8000-000000000007",
+      "name": "Update Order Items",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/sync_cursors",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "resolution=merge-duplicates"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"job_name\": \"sellersnap-costs\", \"cursor_value\": \"{{ $now.toISO() }}\", \"updated_at\": \"{{ $now.toISO() }}\"}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 500],
+      "id": "a1b2c3d4-0008-4000-8000-000000000008",
+      "name": "Upsert Sync Cursor",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Amazon Listings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Amazon Listings": {
+      "main": [
+        [
+          {
+            "node": "Fetch Walmart Listings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Walmart Listings": {
+      "main": [
+        [
+          {
+            "node": "Build Cost Map",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Cost Map": {
+      "main": [
+        [
+          {
+            "node": "Loop Over SKUs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over SKUs": {
+      "main": [
+        [
+          {
+            "node": "Update Product Variants",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Upsert Sync Cursor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Product Variants": {
+      "main": [
+        [
+          {
+            "node": "Update Order Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Order Items": {
+      "main": [
+        [
+          {
+            "node": "Loop Over SKUs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

@@ -1,0 +1,409 @@
+{
+  "name": "Sync: ShipStation Shipments",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [180, 300],
+      "id": "a1000001-0001-4000-8000-000000000001",
+      "name": "Every 6 Hours"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/sync_cursors?source=eq.shipstation_shipments&select=cursor_value&limit=1",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "return=representation"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [400, 300],
+      "id": "a1000001-0001-4000-8000-000000000002",
+      "name": "Get Sync Cursor",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Determine the \"since\" date from sync_cursors or default to 7 days ago\nconst cursorRows = $input.all();\nlet since;\n\nif (cursorRows.length > 0 && cursorRows[0].json?.length > 0) {\n  since = cursorRows[0].json[0].cursor_value;\n} else if (cursorRows.length > 0 && cursorRows[0].json?.cursor_value) {\n  since = cursorRows[0].json.cursor_value;\n} else {\n  // Default: 7 days ago\n  const d = new Date();\n  d.setDate(d.getDate() - 7);\n  since = d.toISOString().split('T')[0];\n}\n\nreturn [{\n  json: {\n    since,\n    page: 1,\n    allShipments: [],\n    totalPages: null,\n    done: false\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [620, 300],
+      "id": "a1000001-0001-4000-8000-000000000003",
+      "name": "Init Pagination"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-not-done",
+              "leftValue": "={{ $json.done }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [840, 300],
+      "id": "a1000001-0001-4000-8000-000000000004",
+      "name": "More Pages?"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://ssapi.shipstation.com/shipments?page={{ $json.page }}&pageSize=500&shipDateStart={{ $json.since }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpBasicAuth",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1080, 200],
+      "id": "a1000001-0001-4000-8000-000000000005",
+      "name": "Fetch ShipStation Page",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "HMaOhjiiZTgoiHb5",
+          "name": "ShipStation Basic Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract shipments from ShipStation response and handle pagination\nconst response = $input.first().json;\nconst headers = response.headers || {};\nconst body = response.body || response;\n\nconst shipments = body.shipments || [];\nconst totalPages = body.pages || 1;\nconst total = body.total || 0;\nconst currentPage = $('More Pages?').first().json.page;\nconst since = $('More Pages?').first().json.since;\nconst prevShipments = $('More Pages?').first().json.allShipments || [];\n\n// Accumulate shipments\nconst allShipments = prevShipments.concat(shipments);\n\n// Check rate limit from headers\nconst rateLimitRemaining = parseInt(headers['x-rate-limit-remaining'] || '40');\nconst needsPause = rateLimitRemaining <= 2;\n\nconst done = currentPage >= totalPages || shipments.length === 0;\n\nconsole.log(`Page ${currentPage}/${totalPages}: got ${shipments.length} shipments (total accumulated: ${allShipments.length}/${total})`);\n\nreturn [{\n  json: {\n    since,\n    page: currentPage + 1,\n    allShipments,\n    totalPages,\n    total,\n    done,\n    needsPause,\n    rateLimitRemaining\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1300, 200],
+      "id": "a1000001-0001-4000-8000-000000000006",
+      "name": "Accumulate & Check Pagination"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-rate-limit",
+              "leftValue": "={{ $json.needsPause }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1520, 200],
+      "id": "a1000001-0001-4000-8000-000000000007",
+      "name": "Rate Limited?"
+    },
+    {
+      "parameters": {
+        "amount": 11,
+        "unit": "seconds"
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1740, 100],
+      "id": "a1000001-0001-4000-8000-000000000008",
+      "name": "Wait 11s (Rate Limit)",
+      "webhookId": "ss-rate-limit-wait"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Transform all accumulated ShipStation shipments to Supabase schema\nconst input = $input.first().json;\nconst shipments = input.allShipments || [];\nconst since = input.since;\n\nconst CARRIER_NAMES = {\n  stamps_com: 'USPS (Stamps.com)', usps: 'USPS', ups: 'UPS', ups_walleted: 'UPS',\n  fedex: 'FedEx', amazon_buy_shipping: 'Amazon Buy Shipping',\n  dhl_express: 'DHL Express', ontrac: 'OnTrac'\n};\n\nconst stats = { total: shipments.length, transformed: 0, skipped: 0 };\nconst rows = [];\n\nfor (const ss of shipments) {\n  const ssId = String(ss.shipmentId);\n  const orderNumber = ss.orderNumber;\n  const tracking = ss.trackingNumber;\n  const cost = ss.shipmentCost ?? null;\n  const carrier = ss.carrierCode || null;\n  const service = ss.serviceCode || null;\n  const dims = ss.dimensions || {};\n  const weightOz = ss.weight?.units === 'ounces' ? ss.weight?.value :\n                   ss.weight?.units === 'pounds' ? (ss.weight?.value || 0) * 16 :\n                   ss.weight?.value || null;\n\n  rows.push({\n    order_number: orderNumber,\n    label_source: 'shipstation',\n    data_source: 'shipstation',\n    status: ss.voided ? 'cancelled' : (tracking ? 'in_transit' : 'label_printed'),\n    carrier_name: CARRIER_NAMES[carrier] || carrier,\n    carrier_code: carrier,\n    carrier_service: service,\n    service_code: service,\n    tracking_number: tracking,\n    label_created_at: ss.createDate,\n    shipped_at: ss.shipDate ? ss.shipDate + 'T00:00:00Z' : null,\n    label_cost: cost,\n    insurance_cost: ss.insuranceCost || 0,\n    total_cost: cost != null ? +(cost + (ss.insuranceCost || 0)).toFixed(2) : null,\n    weight_oz: weightOz,\n    length_in: dims.length || null,\n    width_in: dims.width || null,\n    height_in: dims.height || null,\n    is_voided: ss.voided || false,\n    voided_at: ss.voidDate || null,\n    confirmation_type: ss.confirmation || null,\n    external_ids: { shipstation: ssId }\n  });\n  stats.transformed++;\n}\n\nconsole.log(`Transformed ${stats.transformed}/${stats.total} shipments`);\n\n// Batch into chunks of 500 for upsert\nconst BATCH_SIZE = 500;\nconst batches = [];\nfor (let i = 0; i < rows.length; i += BATCH_SIZE) {\n  batches.push(rows.slice(i, i + BATCH_SIZE));\n}\n\nreturn batches.map((batch, idx) => ({\n  json: {\n    batch,\n    batchIndex: idx,\n    totalBatches: batches.length,\n    stats,\n    since\n  }\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 500],
+      "id": "a1000001-0001-4000-8000-000000000009",
+      "name": "Transform to Supabase Schema"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/shipments",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "return=minimal,resolution=merge-duplicates"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.batch) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1300, 500],
+      "id": "a1000001-0001-4000-8000-000000000010",
+      "name": "Upsert to Supabase",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Collect results from all batch upserts\nconst items = $input.all();\nconst now = new Date().toISOString();\nconst since = items[0]?.json?.since || $('Transform to Supabase Schema').first().json.since;\n\nconst totalUpserted = items.length;\nconsole.log(`Upserted ${totalUpserted} batches to Supabase`);\n\nreturn [{\n  json: {\n    source: 'shipstation_shipments',\n    cursor_value: now.split('T')[0],\n    updated_at: now,\n    totalBatchesProcessed: totalUpserted\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1520, 500],
+      "id": "a1000001-0001-4000-8000-000000000011",
+      "name": "Prepare Cursor Update"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/sync_cursors",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "return=minimal,resolution=merge-duplicates"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ source: $json.source, cursor_value: $json.cursor_value, updated_at: $json.updated_at }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1740, 500],
+      "id": "a1000001-0001-4000-8000-000000000012",
+      "name": "Update Sync Cursor",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 6 Hours": {
+      "main": [
+        [
+          {
+            "node": "Get Sync Cursor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Sync Cursor": {
+      "main": [
+        [
+          {
+            "node": "Init Pagination",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Init Pagination": {
+      "main": [
+        [
+          {
+            "node": "More Pages?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "More Pages?": {
+      "main": [
+        [
+          {
+            "node": "Fetch ShipStation Page",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Transform to Supabase Schema",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch ShipStation Page": {
+      "main": [
+        [
+          {
+            "node": "Accumulate & Check Pagination",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Accumulate & Check Pagination": {
+      "main": [
+        [
+          {
+            "node": "Rate Limited?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rate Limited?": {
+      "main": [
+        [
+          {
+            "node": "Wait 11s (Rate Limit)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "More Pages?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 11s (Rate Limit)": {
+      "main": [
+        [
+          {
+            "node": "More Pages?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transform to Supabase Schema": {
+      "main": [
+        [
+          {
+            "node": "Upsert to Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert to Supabase": {
+      "main": [
+        [
+          {
+            "node": "Prepare Cursor Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Cursor Update": {
+      "main": [
+        [
+          {
+            "node": "Update Sync Cursor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

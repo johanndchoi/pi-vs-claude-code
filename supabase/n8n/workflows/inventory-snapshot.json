@@ -1,0 +1,318 @@
+{
+  "name": "Sync: Inventory Snapshot",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * *"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 300],
+      "id": "inv-snap-0001-0000-0000-000000000001",
+      "name": "Daily 6am Trigger"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/product_variants",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "select", "value": "id,sku" },
+            { "name": "limit", "value": "10000" }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [250, 300],
+      "id": "inv-snap-0001-0000-0000-000000000002",
+      "name": "Load Variant Map",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.veeqo.com/products",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "page_size", "value": "100" }
+          ]
+        },
+        "options": {
+          "pagination": {
+            "paginationMode": "updateAParameterInEachRequest",
+            "parameters": {
+              "conditions": {
+                "options": [
+                  {
+                    "name": "responseIsEmpty",
+                    "value": "responseIsEmpty"
+                  }
+                ]
+              },
+              "limitPagesFetched": true,
+              "maxRequests": 100,
+              "parametersUi": {
+                "values": [
+                  {
+                    "name": "page",
+                    "type": "query",
+                    "value": "={{ $pageCount + 1 }}"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [500, 300],
+      "id": "inv-snap-0001-0000-0000-000000000003",
+      "name": "Fetch Veeqo Products",
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "3HIHmn9LaxU03JrD",
+          "name": "Veeqo API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Build variant SKU → ID lookup from Supabase product_variants\nconst variants = $('Load Variant Map').all();\nconst variantMap = new Map();\nfor (const v of variants) {\n  if (v.json.sku) variantMap.set(v.json.sku, v.json.id);\n}\n\nconst today = new Date().toISOString().split('T')[0];\nconst products = $input.all();\nconst seen = new Map();\n\nfor (const item of products) {\n  const product = item.json;\n  for (const sellable of (product.sellables || [])) {\n    const sku = sellable.sku_code;\n    if (!sku) continue;\n    const variantId = variantMap.get(sku) || null;\n    const stockEntries = sellable.stock_entries || [];\n\n    if (stockEntries.length === 0) {\n      const qty = sellable.quantity_to_sell ?? sellable.stock_level ?? 0;\n      const key = `${sku}::null`;\n      const prev = seen.get(key);\n      if (!prev || qty > prev.quantity) {\n        seen.set(key, { variant_id: variantId, sku, warehouse_id: null, quantity: qty, snapshot_date: today, data_source: 'veeqo' });\n      }\n    } else {\n      for (const entry of stockEntries) {\n        const qty = entry.physical_quantity ?? entry.stock_level ?? 0;\n        const key = `${sku}::null`;\n        const prev = seen.get(key);\n        if (!prev || qty > prev.quantity) {\n          seen.set(key, { variant_id: variantId, sku, warehouse_id: null, quantity: qty, snapshot_date: today, data_source: 'veeqo' });\n        }\n      }\n    }\n  }\n}\n\nconst rows = [...seen.values()];\nif (rows.length === 0) {\n  return [{ json: { _empty: true, rowCount: 0 } }];\n}\n\n// Chunk into batches of 500 for Supabase upsert\nconst BATCH = 500;\nconst batches = [];\nfor (let i = 0; i < rows.length; i += BATCH) {\n  batches.push({ json: { _empty: false, rowCount: rows.length, rows: rows.slice(i, i + BATCH) } });\n}\nreturn batches;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [750, 300],
+      "id": "inv-snap-0001-0000-0000-000000000004",
+      "name": "Transform Veeqo Data"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-has-rows",
+              "leftValue": "={{ $json._empty }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1000, 300],
+      "id": "inv-snap-0001-0000-0000-000000000005",
+      "name": "IF: Has Snapshot Rows"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://ssapi.shipstation.com/products",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpBasicAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "pageSize", "value": "500" },
+            { "name": "page", "value": "1" }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1250, 520],
+      "id": "inv-snap-0001-0000-0000-000000000006",
+      "name": "Fetch ShipStation Products",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "HMaOhjiiZTgoiHb5",
+          "name": "ShipStation API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Build variant SKU → ID lookup\nconst variants = $('Load Variant Map').all();\nconst variantMap = new Map();\nfor (const v of variants) {\n  if (v.json.sku) variantMap.set(v.json.sku, v.json.id);\n}\n\nconst today = new Date().toISOString().split('T')[0];\nconst items = $input.all();\nconst seen = new Map();\n\n// ShipStation /products response is { products: [...], pages, page }\nfor (const item of items) {\n  const products = item.json.products || [item.json];\n  for (const product of products) {\n    const sku = product.sku;\n    if (!sku) continue;\n    const variantId = variantMap.get(sku) || null;\n    const key = `${sku}::null`;\n    if (!seen.has(key)) {\n      seen.set(key, { variant_id: variantId, sku, warehouse_id: null, quantity: 0, snapshot_date: today, data_source: 'shipstation' });\n    }\n  }\n}\n\nconst rows = [...seen.values()];\nif (rows.length === 0) {\n  return [{ json: { _empty: true, rowCount: 0 } }];\n}\n\nconst BATCH = 500;\nconst batches = [];\nfor (let i = 0; i < rows.length; i += BATCH) {\n  batches.push({ json: { _empty: false, rowCount: rows.length, rows: rows.slice(i, i + BATCH) } });\n}\nreturn batches;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1500, 520],
+      "id": "inv-snap-0001-0000-0000-000000000007",
+      "name": "Transform ShipStation Data"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/inventory_snapshots",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.rows) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "resolution=ignore-duplicates,return=minimal"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1750, 300],
+      "id": "inv-snap-0001-0000-0000-000000000008",
+      "name": "Upsert Snapshots",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/sync_cursors",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ job_name: 'inventory-snapshot', cursor_value: new Date().toISOString().split('T')[0], updated_at: new Date().toISOString() }) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "resolution=merge-duplicates,return=minimal"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2000, 300],
+      "id": "inv-snap-0001-0000-0000-000000000009",
+      "name": "Update Sync Cursor",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase API"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 6am Trigger": {
+      "main": [
+        [
+          { "node": "Load Variant Map", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Load Variant Map": {
+      "main": [
+        [
+          { "node": "Fetch Veeqo Products", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Fetch Veeqo Products": {
+      "main": [
+        [
+          { "node": "Transform Veeqo Data", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Fetch ShipStation Products", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Transform Veeqo Data": {
+      "main": [
+        [
+          { "node": "IF: Has Snapshot Rows", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "IF: Has Snapshot Rows": {
+      "main": [
+        [
+          { "node": "Upsert Snapshots", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Fetch ShipStation Products", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Fetch ShipStation Products": {
+      "main": [
+        [
+          { "node": "Transform ShipStation Data", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Transform ShipStation Data": {
+      "main": [
+        [
+          { "node": "Upsert Snapshots", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Upsert Snapshots": {
+      "main": [
+        [
+          { "node": "Update Sync Cursor", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

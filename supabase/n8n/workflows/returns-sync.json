@@ -1,0 +1,693 @@
+{
+  "name": "Sync: Returns",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 12
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 300],
+      "id": "a0000001-0000-0000-0000-000000000001",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "reportTypes", "value": "GET_FLAT_FILE_RETURNS_DATA_BY_RETURN_DATE" },
+            { "name": "pageSize", "value": "50" }
+          ]
+        },
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpCustomAuth",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 300],
+      "id": "a0000001-0000-0000-0000-000000000002",
+      "name": "Fetch Amazon Report List",
+      "credentials": {
+        "httpCustomAuth": {
+          "id": "Ok0qiTbXLIzVMHjV",
+          "name": "Amazon SP-API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Load cursor from incoming static data\nconst staticData = $getWorkflowStaticData('global');\nconst processedIds = new Set(staticData.amazon_report_ids || []);\n\nconst reports = ($input.first().json.reports || []).filter(r => r.processingStatus === 'DONE');\n\n// Filter to big 60-day window reports + most recent daily\nconst bigReports = reports.filter(r => {\n  const start = new Date(r.dataStartTime);\n  const end = new Date(r.dataEndTime);\n  return (end - start) > 30 * 86400000;\n});\nconst latestDaily = reports.find(r => {\n  const start = new Date(r.dataStartTime);\n  const end = new Date(r.dataEndTime);\n  return (end - start) <= 35 * 86400000;\n});\n\nconst toProcess = [...bigReports];\nif (latestDaily && !bigReports.find(r => r.reportId === latestDaily.reportId)) {\n  toProcess.unshift(latestDaily);\n}\n\n// Incremental: skip already-processed\nconst filtered = toProcess.filter(r => !processedIds.has(r.reportId));\n\nif (filtered.length === 0) {\n  return [{ json: { _no_reports: true, message: 'No new Amazon reports' } }];\n}\n\nreturn filtered.map(r => ({ json: r }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 300],
+      "id": "a0000001-0000-0000-0000-000000000003",
+      "name": "Filter New Reports"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond1",
+              "leftValue": "={{ $json._no_reports }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "notTrue" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [700, 300],
+      "id": "a0000001-0000-0000-0000-000000000004",
+      "name": "Has Reports?"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/reports/{{ $json.reportId }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpCustomAuth",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [940, 200],
+      "id": "a0000001-0000-0000-0000-000000000005",
+      "name": "Get Report Details",
+      "credentials": {
+        "httpCustomAuth": {
+          "id": "Ok0qiTbXLIzVMHjV",
+          "name": "Amazon SP-API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://sellingpartnerapi-na.amazon.com/reports/2021-06-30/documents/{{ $json.reportDocumentId }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpCustomAuth",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1180, 200],
+      "id": "a0000001-0000-0000-0000-000000000006",
+      "name": "Get Report Document URL",
+      "credentials": {
+        "httpCustomAuth": {
+          "id": "Ok0qiTbXLIzVMHjV",
+          "name": "Amazon SP-API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.url }}",
+        "options": {
+          "response": { "response": { "responseFormat": "text" } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1420, 200],
+      "id": "a0000001-0000-0000-0000-000000000007",
+      "name": "Download Report TSV"
+    },
+    {
+      "parameters": {
+        "jsCode": "const tsv = $input.first().json.data;\nconst reportId = $('Get Report Details').first().json.reportId;\nconst lines = tsv.split('\\n').filter(l => l.trim());\nconst headers = lines[0].split('\\t');\nconst rows = lines.slice(1).map(l => {\n  const vals = l.split('\\t');\n  const row = {};\n  headers.forEach((h, i) => row[h] = vals[i]?.trim() || '');\n  return row;\n});\n\n// Reason mapping\nfunction mapAmazonReason(reason) {\n  const map = {\n    'CR-DEFECTIVE': 'defective', 'CR-QUALITY_UNACCEPTABLE': 'defective',\n    'CR-DAMAGED_BY_CARRIER': 'damaged_in_transit', 'CR-DAMAGED_BY_FC': 'damaged_in_transit',\n    'CR-WRONG_ITEM': 'wrong_item', 'CR-NOT_AS_DESCRIBED': 'not_as_described',\n    'CR-MISSED_ESTIMATED_DELIVERY': 'arrived_late', 'CR-SWITCHEROO': 'wrong_item',\n    'CR-MISSING_PARTS': 'missing_parts', 'CR-BUYER_REMORSE': 'no_longer_needed',\n    'CR-UNWANTED_ITEM': 'no_longer_needed', 'CR-NO_REASON': 'other',\n    'LOST_IN_TRANSIT': 'damaged_in_transit'\n  };\n  return map[reason] || 'other';\n}\n\nfunction mapAmazonStatus(status) {\n  const map = {\n    'Approved': 'approved', 'Completed': 'refunded',\n    'Unit returned': 'received', 'Pending': 'requested', 'Denied': 'rejected'\n  };\n  return map[status] || 'requested';\n}\n\nfunction parseDate(d) {\n  if (!d || !d.trim()) return null;\n  const parsed = new Date(d);\n  return isNaN(parsed) ? null : parsed.toISOString();\n}\n\nconst seenRMAs = new Set();\nconst results = [];\n\nfor (const row of rows) {\n  const rma = row['Amazon RMA ID'];\n  if (!rma || seenRMAs.has(rma)) continue;\n  seenRMAs.add(rma);\n\n  let status = mapAmazonStatus(row['Return request status']);\n  if (row['Resolution'] === 'StandardRefund' || row['Resolution'] === 'RefundAtFirstScan') {\n    status = 'refunded';\n  }\n\n  results.push({\n    json: {\n      _reportId: reportId,\n      _type: 'amazon',\n      order_number: row['Order ID'],\n      sku: row['Merchant SKU'],\n      return_data: {\n        status,\n        reason: mapAmazonReason(row['Return Reason']),\n        reason_detail: row['Return Reason'],\n        rma_number: rma,\n        return_label_tracking: row['Tracking ID'] || null,\n        return_carrier: row['Return carrier'] || null,\n        requested_at: parseDate(row['Return request date']),\n        received_at: parseDate(row['Return delivery date']),\n        return_shipping_cost: parseFloat(row['Label cost']) || 0,\n        paid_by: row['Label to be paid by'] === 'Amazon' ? 'channel' : 'seller',\n        external_ids: { amazon_rma: rma, amazon_order_item: row['Order Item ID'] },\n        metadata: {\n          label_type: row['Label type'],\n          return_type: row['Return type'],\n          resolution: row['Resolution'],\n          is_prime: row['Is prime'] === 'Y',\n          asin: row['ASIN'],\n          in_policy: row['In policy'] === 'Y',\n          safet_claim_id: row['SafeT claim id'] || null\n        }\n      },\n      quantity: parseInt(row['Return quantity']) || 1,\n      refund_amount: parseFloat(row['Refunded Amount']) || parseFloat(row['Order Amount']) || 0,\n      resolution: row['Resolution']\n    }\n  });\n}\n\nif (results.length === 0) {\n  return [{ json: { _no_items: true, _reportId: reportId } }];\n}\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1660, 200],
+      "id": "a0000001-0000-0000-0000-000000000008",
+      "name": "Parse Amazon TSV"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond2",
+              "leftValue": "={{ $json._no_items }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "notTrue" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1900, 200],
+      "id": "a0000001-0000-0000-0000-000000000009",
+      "name": "Has Items?"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/orders?order_number=eq.{{ encodeURIComponent($json.order_number) }}&select=id",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "options": {
+          "batching": { "batch": { "batchSize": 1, "batchInterval": 100 } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2140, 100],
+      "id": "a0000001-0000-0000-0000-000000000010",
+      "name": "Lookup Order",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const orderRows = item.json;\n  // Supabase returns array; httpRequest node unwraps, so check\n  const orderId = Array.isArray(orderRows) ? orderRows[0]?.id : orderRows?.id;\n  \n  // Get the paired input from the previous node by index\n  const idx = items.indexOf(item);\n  const original = $('Has Items?').all()[idx]?.json;\n  \n  if (!orderId || !original) continue;\n  \n  const rd = original.return_data;\n  rd.order_id = orderId;\n  \n  results.push({\n    json: {\n      ...original,\n      order_id: orderId,\n      return_data: rd\n    }\n  });\n}\n\nif (results.length === 0) {\n  return [{ json: { _empty: true } }];\n}\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2380, 100],
+      "id": "a0000001-0000-0000-0000-000000000011",
+      "name": "Match Orders"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/returns",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Prefer", "value": "resolution=merge-duplicates,return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.return_data) }}",
+        "options": {
+          "batching": { "batch": { "batchSize": 1, "batchInterval": 50 } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2620, 100],
+      "id": "a0000001-0000-0000-0000-000000000012",
+      "name": "Upsert Return",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst originals = $('Match Orders').all();\nconst results = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const upserted = Array.isArray(items[i].json) ? items[i].json[0] : items[i].json;\n  const orig = originals[i]?.json;\n  if (!upserted?.id || !orig) continue;\n  \n  // Build return_item record\n  if (orig.sku && orig.order_id) {\n    results.push({\n      json: {\n        _action: 'return_item_lookup',\n        return_id: upserted.id,\n        order_id: orig.order_id,\n        sku: orig.sku,\n        quantity: orig.quantity || 1,\n        reason: orig.return_data.reason,\n        refund_amount: orig.refund_amount || 0,\n        resolution: orig.resolution,\n        rma_number: orig.return_data.rma_number,\n        _type: orig._type\n      }\n    });\n  }\n}\n\nif (results.length === 0) {\n  return [{ json: { _empty: true } }];\n}\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2860, 100],
+      "id": "a0000001-0000-0000-0000-000000000013",
+      "name": "Prepare Return Items"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/order_items?order_id=eq.{{ $json.order_id }}&sku=eq.{{ encodeURIComponent($json.sku) }}&select=id,variant_id&limit=1",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "options": {
+          "batching": { "batch": { "batchSize": 1, "batchInterval": 100 } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3100, 100],
+      "id": "a0000001-0000-0000-0000-000000000014",
+      "name": "Lookup Order Item",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst originals = $('Prepare Return Items').all();\nconst returnItems = [];\nconst refunds = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const oiRows = Array.isArray(items[i].json) ? items[i].json : [items[i].json];\n  const oi = oiRows[0];\n  const orig = originals[i]?.json;\n  if (!orig) continue;\n\n  if (oi?.id) {\n    returnItems.push({\n      return_id: orig.return_id,\n      order_item_id: oi.id,\n      variant_id: oi.variant_id || null,\n      quantity: orig.quantity,\n      reason: orig.reason\n    });\n  }\n\n  if (orig.refund_amount > 0) {\n    refunds.push({\n      order_id: orig.order_id,\n      return_id: orig.return_id,\n      refund_type: orig.resolution === 'StandardRefund' ? 'full' : 'partial',\n      amount: orig.refund_amount,\n      total_refund: orig.refund_amount,\n      status: 'completed',\n      channel_id: '7f84462f-86c8-4e09-abb6-285631db0d83',\n      external_ref: 'amz-' + orig.rma_number,\n      metadata: { resolution: orig.resolution }\n    });\n  }\n}\n\nconst output = [];\nif (returnItems.length > 0) output.push({ json: { _batch: 'return_items', items: returnItems } });\nif (refunds.length > 0) output.push({ json: { _batch: 'refunds', items: refunds } });\nif (output.length === 0) return [{ json: { _empty: true } }];\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3340, 100],
+      "id": "a0000001-0000-0000-0000-000000000015",
+      "name": "Build Return Items & Refunds"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/return_items",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json._batch === 'return_items' ? $json.items : []) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3580, 0],
+      "id": "a0000001-0000-0000-0000-000000000016",
+      "name": "Insert Return Items",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/refunds",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json._batch === 'refunds' ? $json.items : []) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3580, 200],
+      "id": "a0000001-0000-0000-0000-000000000017",
+      "name": "Insert Refunds",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Save processed report IDs to static data\nconst staticData = $getWorkflowStaticData('global');\nconst processedIds = new Set(staticData.amazon_report_ids || []);\n\n// Collect all reportIds from the batch\nconst allItems = $('Parse Amazon TSV').all();\nfor (const item of allItems) {\n  if (item.json._reportId) processedIds.add(item.json._reportId);\n}\n\nstaticData.amazon_report_ids = [...processedIds];\n\nreturn [{ json: { status: 'amazon_cursor_saved', count: processedIds.size } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3820, 100],
+      "id": "a0000001-0000-0000-0000-000000000018",
+      "name": "Save Amazon Cursor"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://marketplace.walmartapis.com/v3/returns",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "limit", "value": "200" },
+            { "name": "returnCreationStartDate", "value": "={{ $now.minus(30, 'days').toISO() }}" },
+            { "name": "returnCreationEndDate", "value": "={{ $now.toISO() }}" }
+          ]
+        },
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "WM_SVC.NAME", "value": "Walmart Marketplace" },
+            { "name": "WM_QOS.CORRELATION_ID", "value": "=returns-{{ $now.toMillis() }}" },
+            { "name": "Accept", "value": "application/json" }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 600],
+      "id": "a0000001-0000-0000-0000-000000000019",
+      "name": "Fetch Walmart Returns",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "cvTnlRf6bR41gyKH",
+          "name": "Walmart API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst returns = data?.returnOrders || [];\n\nfunction mapWalmartReason(reason) {\n  const map = {\n    'DAMAGED': 'damaged_in_transit', 'DEFECTIVE': 'defective',\n    'WRONG_ITEM': 'wrong_item', 'NOT_AS_DESCRIBED': 'not_as_described',\n    'LOST_IN_TRANSIT': 'damaged_in_transit', 'ARRIVED_LATE': 'arrived_late',\n    'MISSING_PARTS': 'missing_parts', 'NO_LONGER_NEEDED': 'no_longer_needed',\n    'CHANGED_MIND': 'no_longer_needed'\n  };\n  return map[reason] || 'other';\n}\n\nconst results = [];\nfor (const ret of returns) {\n  const firstLine = ret.returnOrderLines?.[0];\n  const reason = firstLine?.returnReason || 'other';\n  const rma = 'WM-' + ret.returnOrderId;\n  const totalRefund = ret.totalRefundAmount?.currencyAmount || 0;\n\n  results.push({\n    json: {\n      _type: 'walmart',\n      order_number: ret.customerOrderId,\n      return_data: {\n        status: totalRefund > 0 ? 'refunded' : 'approved',\n        reason: mapWalmartReason(reason),\n        reason_detail: firstLine?.returnDescription || reason,\n        rma_number: rma,\n        requested_at: ret.returnOrderDate,\n        return_shipping_cost: 0,\n        paid_by: 'channel',\n        external_ids: { walmart_return_id: ret.returnOrderId },\n        metadata: {\n          refund_mode: ret.refundMode,\n          return_by_date: ret.returnByDate,\n          customer_email: ret.customerEmailId\n        }\n      },\n      return_lines: (ret.returnOrderLines || []).map(line => ({\n        sku: line.item?.sku,\n        reason: mapWalmartReason(line.returnReason)\n      })),\n      refund_amount: totalRefund,\n      walmart_return_id: ret.returnOrderId\n    }\n  });\n}\n\nif (results.length === 0) {\n  return [{ json: { _empty: true, message: 'No Walmart returns' } }];\n}\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 600],
+      "id": "a0000001-0000-0000-0000-000000000020",
+      "name": "Parse Walmart Returns"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond3",
+              "leftValue": "={{ $json._empty }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "notTrue" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [700, 600],
+      "id": "a0000001-0000-0000-0000-000000000021",
+      "name": "Has WM Returns?"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/orders?order_number=eq.{{ encodeURIComponent($json.order_number) }}&select=id",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "options": {
+          "batching": { "batch": { "batchSize": 1, "batchInterval": 100 } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [940, 500],
+      "id": "a0000001-0000-0000-0000-000000000022",
+      "name": "Lookup WM Order",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst originals = $('Has WM Returns?').all();\nconst results = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const orderRows = Array.isArray(items[i].json) ? items[i].json : [items[i].json];\n  const orderId = orderRows[0]?.id;\n  const orig = originals[i]?.json;\n  if (!orderId || !orig) continue;\n\n  const rd = { ...orig.return_data, order_id: orderId };\n  results.push({ json: { ...orig, order_id: orderId, return_data: rd } });\n}\n\nif (results.length === 0) return [{ json: { _empty: true } }];\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1180, 500],
+      "id": "a0000001-0000-0000-0000-000000000023",
+      "name": "Match WM Orders"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/returns",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Prefer", "value": "resolution=merge-duplicates,return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.return_data) }}",
+        "options": {
+          "batching": { "batch": { "batchSize": 1, "batchInterval": 50 } }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1420, 500],
+      "id": "a0000001-0000-0000-0000-000000000024",
+      "name": "Upsert WM Return",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst originals = $('Match WM Orders').all();\nconst returnItems = [];\nconst refunds = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const upserted = Array.isArray(items[i].json) ? items[i].json[0] : items[i].json;\n  const orig = originals[i]?.json;\n  if (!upserted?.id || !orig) continue;\n\n  // Each return line becomes a return_item lookup\n  for (const line of (orig.return_lines || [])) {\n    if (line.sku) {\n      returnItems.push({\n        _lookup: true,\n        return_id: upserted.id,\n        order_id: orig.order_id,\n        sku: line.sku,\n        quantity: 1,\n        reason: line.reason\n      });\n    }\n  }\n\n  if (orig.refund_amount > 0) {\n    refunds.push({\n      order_id: orig.order_id,\n      return_id: upserted.id,\n      refund_type: 'full',\n      amount: orig.refund_amount,\n      total_refund: orig.refund_amount,\n      status: 'completed',\n      channel_id: '2da7e1e0-579e-4968-bdef-fa18492a6a86',\n      external_ref: 'wm-' + orig.walmart_return_id,\n      metadata: { refund_mode: orig.return_data.metadata?.refund_mode }\n    });\n  }\n}\n\nconst output = [];\nif (returnItems.length > 0) output.push({ json: { _batch: 'wm_return_items', items: returnItems } });\nif (refunds.length > 0) output.push({ json: { _batch: 'wm_refunds', items: refunds } });\nif (output.length === 0) return [{ json: { _empty: true } }];\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1660, 500],
+      "id": "a0000001-0000-0000-0000-000000000025",
+      "name": "Build WM Return Items & Refunds"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/refunds",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json._batch === 'wm_refunds' ? $json.items : []) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1900, 600],
+      "id": "a0000001-0000-0000-0000-000000000026",
+      "name": "Insert WM Refunds",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Update sync_cursors for walmart\nconst now = new Date().toISOString();\nreturn [{ json: { sync_name: 'returns-sync-walmart', cursor_value: now, updated_at: now } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2140, 600],
+      "id": "a0000001-0000-0000-0000-000000000027",
+      "name": "Build WM Cursor"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/sync_cursors",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Prefer", "value": "resolution=merge-duplicates" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2380, 600],
+      "id": "a0000001-0000-0000-0000-000000000028",
+      "name": "Save WM Cursor",
+      "credentials": {
+        "supabaseApi": {
+          "id": "gHruXnC2qqFwxMPZ",
+          "name": "Supabase"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          { "node": "Fetch Amazon Report List", "type": "main", "index": 0 },
+          { "node": "Fetch Walmart Returns", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Fetch Amazon Report List": {
+      "main": [
+        [{ "node": "Filter New Reports", "type": "main", "index": 0 }]
+      ]
+    },
+    "Filter New Reports": {
+      "main": [
+        [{ "node": "Has Reports?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Has Reports?": {
+      "main": [
+        [{ "node": "Get Report Details", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Get Report Details": {
+      "main": [
+        [{ "node": "Get Report Document URL", "type": "main", "index": 0 }]
+      ]
+    },
+    "Get Report Document URL": {
+      "main": [
+        [{ "node": "Download Report TSV", "type": "main", "index": 0 }]
+      ]
+    },
+    "Download Report TSV": {
+      "main": [
+        [{ "node": "Parse Amazon TSV", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse Amazon TSV": {
+      "main": [
+        [{ "node": "Has Items?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Has Items?": {
+      "main": [
+        [{ "node": "Lookup Order", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Lookup Order": {
+      "main": [
+        [{ "node": "Match Orders", "type": "main", "index": 0 }]
+      ]
+    },
+    "Match Orders": {
+      "main": [
+        [{ "node": "Upsert Return", "type": "main", "index": 0 }]
+      ]
+    },
+    "Upsert Return": {
+      "main": [
+        [{ "node": "Prepare Return Items", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prepare Return Items": {
+      "main": [
+        [{ "node": "Lookup Order Item", "type": "main", "index": 0 }]
+      ]
+    },
+    "Lookup Order Item": {
+      "main": [
+        [{ "node": "Build Return Items & Refunds", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Return Items & Refunds": {
+      "main": [
+        [
+          { "node": "Insert Return Items", "type": "main", "index": 0 },
+          { "node": "Insert Refunds", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Insert Return Items": {
+      "main": [
+        [{ "node": "Save Amazon Cursor", "type": "main", "index": 0 }]
+      ]
+    },
+    "Insert Refunds": {
+      "main": [
+        [{ "node": "Save Amazon Cursor", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Walmart Returns": {
+      "main": [
+        [{ "node": "Parse Walmart Returns", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse Walmart Returns": {
+      "main": [
+        [{ "node": "Has WM Returns?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Has WM Returns?": {
+      "main": [
+        [{ "node": "Lookup WM Order", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Lookup WM Order": {
+      "main": [
+        [{ "node": "Match WM Orders", "type": "main", "index": 0 }]
+      ]
+    },
+    "Match WM Orders": {
+      "main": [
+        [{ "node": "Upsert WM Return", "type": "main", "index": 0 }]
+      ]
+    },
+    "Upsert WM Return": {
+      "main": [
+        [{ "node": "Build WM Return Items & Refunds", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build WM Return Items & Refunds": {
+      "main": [
+        [{ "node": "Insert WM Refunds", "type": "main", "index": 0 }]
+      ]
+    },
+    "Insert WM Refunds": {
+      "main": [
+        [{ "node": "Build WM Cursor", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build WM Cursor": {
+      "main": [
+        [{ "node": "Save WM Cursor", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

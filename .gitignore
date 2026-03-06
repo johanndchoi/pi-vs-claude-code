@@ -18,4 +18,3 @@ start-pi.sh
 
 # bv (beads viewer) local config and caches
 .bv/
-supabase/n8n/workflows/
