@@ -1,0 +1,134 @@
+{
+  "name": "Sub: Walmart Token",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "wt1",
+      "name": "Execute Sub-workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/sync_cursors?source=eq.walmart_token&limit=1",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "options": { "response": { "response": { "responseFormat": "json" } } }
+      },
+      "id": "wt2",
+      "name": "Read Cached Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [440, 0],
+      "credentials": { "supabaseApi": { "id": "gHruXnC2qqFwxMPZ", "name": "Supabase account" } }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const rows = $input.all().map(i => i.json);\nconst flat = Array.isArray(rows[0]) ? rows[0] : rows;\nconst cached = flat[0] || {};\nconst meta = cached.metadata || {};\nconst token = meta.access_token || '';\nconst expiresAt = meta.expires_at || '';\nconst now = new Date().toISOString();\nconst isValid = token && expiresAt && expiresAt > now;\nreturn [{ json: { isValid: isValid ? 'true' : 'false', access_token: token } }];"
+      },
+      "id": "wt3",
+      "name": "Check Expiry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "" },
+          "conditions": [
+            { "id": "c1", "leftValue": "={{ $json.isValid }}", "rightValue": "true", "operator": { "type": "string", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "wt4",
+      "name": "Token Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [880, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const token = $input.first().json.access_token;\nreturn [{ json: { access_token: token } }];"
+      },
+      "id": "wt5",
+      "name": "Return Cached",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, -100]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://marketplace.walmartapis.com/v3/token",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "WM_SVC.NAME", "value": "Walmart Marketplace" },
+          { "name": "WM_QOS.CORRELATION_ID", "value": "={{ 'n8n-token-' + Date.now() }}" },
+          { "name": "Accept", "value": "application/json" }
+        ]},
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": { "parameters": [{ "name": "grant_type", "value": "client_credentials" }] },
+        "options": {}
+      },
+      "id": "wt6",
+      "name": "Refresh Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [1100, 100],
+      "credentials": { "httpBasicAuth": { "id": "cvTnlRf6bR41gyKH", "name": "Walmart API Credentials" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://skgzcllomhsmpbkdnqqc.supabase.co/rest/v1/sync_cursors?on_conflict=source",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Content-Type", "value": "application/json" },
+          { "name": "Prefer", "value": "return=minimal,resolution=merge-duplicates" }
+        ]},
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ source: 'walmart_token', cursor_value: new Date().toISOString(), metadata: { access_token: $json.access_token, expires_at: new Date(Date.now() + (($json.expires_in || 900) - 60) * 1000).toISOString() } }) }}",
+        "options": {}
+      },
+      "id": "wt7",
+      "name": "Cache Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [1320, 100],
+      "credentials": { "supabaseApi": { "id": "gHruXnC2qqFwxMPZ", "name": "Supabase account" } }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const token = $('Refresh Token').first().json.access_token;\nreturn [{ json: { access_token: token } }];"
+      },
+      "id": "wt8",
+      "name": "Return Fresh",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1540, 100]
+    }
+  ],
+  "connections": {
+    "Execute Sub-workflow Trigger": { "main": [[{ "node": "Read Cached Token", "type": "main", "index": 0 }]] },
+    "Read Cached Token": { "main": [[{ "node": "Check Expiry", "type": "main", "index": 0 }]] },
+    "Check Expiry": { "main": [[{ "node": "Token Valid?", "type": "main", "index": 0 }]] },
+    "Token Valid?": { "main": [[{ "node": "Return Cached", "type": "main", "index": 0 }], [{ "node": "Refresh Token", "type": "main", "index": 0 }]] },
+    "Refresh Token": { "main": [[{ "node": "Cache Token", "type": "main", "index": 0 }]] },
+    "Cache Token": { "main": [[{ "node": "Return Fresh", "type": "main", "index": 0 }]] }
+  },
+  "settings": {}
+}
